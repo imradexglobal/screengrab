@@ -37,6 +37,7 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -75,18 +76,194 @@ DB_PATH = _resolve_db_path()
 APP_DATA_DIR = DB_PATH.parent
 
 
+class _ResultSet:
+    """A cursor whose rows are materialised while the connection lock is held.
+
+    Why this exists
+    ---------------
+    ``sqlite3.Cursor`` streams rows lazily: ``Connection.execute()`` steps the
+    statement once and returns, then ``Cursor.fetchone()`` goes back into the C
+    API later.  On a connection shared between the GUI, scan and rebuild
+    threads that leaves a window where one thread builds Python row objects
+    while another is inside ``sqlite3_step`` on the *same* connection.  That is
+    undefined behaviour and corrupts the values being read - a ``NOT NULL TEXT``
+    column has been observed coming back as ``None``, as ``''``, as a missing
+    row, plus ``IndexError: tuple index out of range`` and ``InterfaceError``.
+
+    That is what produced the dashboard's
+    ``TypeError: float() argument must be a string or a real number,
+    not 'NoneType'`` - ``_get_setting`` really did get ``None`` back for
+    ``min_ocr_confidence`` even though the stored value is ``'70.0'``.
+
+    Every row is therefore fetched, converted and stored *inside* the single
+    locked ``execute()`` call.  What the caller gets is plain Python data with
+    no live statement behind it, so ``fetchone()``/``fetchall()``/iteration can
+    never race with another thread, and the statement is finalised (still under
+    the lock) before the cursor is handed back.  The lock is only ever held for
+    that one call, so it can never be left stuck.
+    """
+
+    __slots__ = ("_rows", "_pos", "_lastrowid", "_rowcount",
+                 "_description", "_arraysize")
+
+    def __init__(self, rows, lastrowid, rowcount, description) -> None:
+        self._rows = rows
+        self._pos = 0
+        self._lastrowid = lastrowid
+        self._rowcount = rowcount
+        self._description = description
+        self._arraysize = 1
+
+    # -- read API --------------------------------------------------------
+    def fetchone(self):
+        if self._pos >= len(self._rows):
+            return None
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
+
+    def fetchall(self):
+        rows = self._rows[self._pos:]
+        self._pos = len(self._rows)
+        return rows
+
+    def fetchmany(self, size=None):
+        if size is None:
+            size = self._arraysize
+        rows = self._rows[self._pos:self._pos + size]
+        self._pos += len(rows)
+        return rows
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._pos >= len(self._rows):
+            raise StopIteration
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
+
+    def close(self) -> None:
+        # The underlying statement was already finalised under the lock.
+        pass
+
+    # -- metadata --------------------------------------------------------
+    @property
+    def lastrowid(self):
+        return self._lastrowid
+
+    @property
+    def rowcount(self):
+        return self._rowcount
+
+    @property
+    def description(self):
+        return self._description
+
+    @property
+    def arraysize(self):
+        return self._arraysize
+
+    @arraysize.setter
+    def arraysize(self, value) -> None:
+        self._arraysize = value
+
+
+class SerializedConnection(sqlite3.Connection):
+    """A SQLite connection that is safe to use from several threads.
+
+    The monitoring engine shares **one** connection between the GUI thread,
+    the background scan thread and the "Recalculate App Brain" worker.
+
+    Python's ``sqlite3`` module keeps *implicit transaction state on the
+    connection object itself*: with the default ``isolation_level=""`` it
+    issues ``BEGIN`` before a DML statement and ``COMMIT`` on
+    ``Connection.commit()``.  When two threads interleave ``execute()`` and
+    ``commit()`` on a single connection that bookkeeping gets out of step and
+    sqlite3 raises spurious errors such as::
+
+        OperationalError: cannot commit - no transaction is active
+        OperationalError: cannot start a transaction within a transaction
+        OperationalError: not an error
+
+    Three changes together remove the problem:
+
+    1. The connection runs in **autocommit mode** (``isolation_level=None``),
+       so Python no longer manages transaction state and ``commit()`` becomes
+       a harmless no-op unless the caller opened an explicit ``BEGIN``.
+    2. Every driver call is guarded by one re-entrant lock.
+    3. Result rows are **materialised inside that locked call** (see
+       :class:`_ResultSet`), because locking ``execute()`` alone is not enough
+       - ``Cursor.fetchone()`` would still re-enter the C API unlocked.
+
+    The lock is only ever held for a single call - never across calls - so a
+    statement that raises can never leave the lock stuck and deadlock the scan
+    loop.  Callers that need a multi-statement transaction (``rebuild.py``)
+    still use explicit ``BEGIN IMMEDIATE`` ... ``COMMIT``/``ROLLBACK``, which
+    autocommit mode preserves unchanged.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._lock = threading.RLock()
+
+    def _materialise(self, cursor) -> _ResultSet:
+        """Copy out everything we need, finalise, and return plain Python data.
+
+        Called with ``self._lock`` already held.
+        """
+        try:
+            # Captured before draining: these mirror what a normal cursor
+            # reports immediately after execute() returns.
+            description = cursor.description
+            lastrowid = cursor.lastrowid
+            rowcount = cursor.rowcount
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+        return _ResultSet(rows, lastrowid, rowcount, description)
+
+    def execute(self, *args, **kwargs) -> _ResultSet:
+        with self._lock:
+            return self._materialise(super().execute(*args, **kwargs))
+
+    def executemany(self, *args, **kwargs) -> _ResultSet:
+        with self._lock:
+            return self._materialise(super().executemany(*args, **kwargs))
+
+    def executescript(self, *args, **kwargs) -> _ResultSet:
+        with self._lock:
+            return self._materialise(super().executescript(*args, **kwargs))
+
+    def commit(self) -> None:
+        with self._lock:
+            return super().commit()
+
+    def rollback(self) -> None:
+        with self._lock:
+            return super().rollback()
+
+    def close(self) -> None:
+        with self._lock:
+            return super().close()
+
+
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     """Get a configured SQLite connection with WAL mode and proper settings.
 
-    ``check_same_thread=False`` is required because the monitoring engine shares
-    one connection between the GUI thread and its background scan thread.  All
-    access to that shared connection is serialised by the engine's model lock,
-    and WAL plus a 30s busy timeout keep concurrent readers safe.
+    ``check_same_thread=False`` is required because the monitoring engine
+    shares one connection between the GUI thread and its background scan
+    thread.  Sharing is then made safe by :class:`SerializedConnection`:
+    autocommit mode removes the shared, thread-visible transaction state that
+    produced spurious ``OperationalError``s, and a per-call lock serialises
+    driver access.  WAL plus a 30s busy timeout keep concurrent readers safe.
     """
     db_path = Path(db_path)
     if db_path.parent:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
+    conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False,
+                           isolation_level=None, factory=SerializedConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

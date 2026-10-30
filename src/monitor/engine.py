@@ -529,8 +529,8 @@ class MonitoringEngine(QObject):
                 self._counters["scans_completed"] += 1
                 self.scan_completed.emit(self.counters())
             except Exception as exc:  # noqa: BLE001
-                logger.error("Scan loop iteration error: %s", exc)
-                self._operational_error()
+                logger.error("Scan loop iteration error", exc_info=True)
+                self._operational_error(exc)
 
             elapsed = time.time() - started
             time.sleep(max(0.0, (interval_ms / 1000.0) - elapsed))
@@ -743,11 +743,15 @@ class MonitoringEngine(QObject):
 
         if status != pipeline.DUPLICATE and self._conn is not None:
             from src.config.repository import record_diagnostic
-            record_diagnostic(
-                self._conn, _DIAGNOSTIC_CATEGORY.get(status, status), detail,
-                raw_text=raw_text, region_id=region_id,
-                session_id=self._current_session_id,
-            )
+            # Taken under the model lock: _reject is also reached from the
+            # capture/OCR failure paths that sit *outside* the lock, and this
+            # write must not run while a rebuild transaction is open.
+            with self._model_lock:
+                record_diagnostic(
+                    self._conn, _DIAGNOSTIC_CATEGORY.get(status, status), detail,
+                    raw_text=raw_text, region_id=region_id,
+                    session_id=self._current_session_id,
+                )
         self.reading_rejected.emit({
             "region_id": region_id, "status": status, "detail": detail,
             "raw_text": raw_text,
@@ -979,13 +983,19 @@ class MonitoringEngine(QObject):
         if self._conn is None:
             return {"ok": False, "error": "database not initialised"}
         self.status_updated.emit("Recalculating app brain...")
-        result = recalculate_app_brain(
-            self._conn,
-            algorithm_version=self._get_setting("algorithm_version", "1.0"),
-            pattern_lengths=self._pattern_lengths(),
-            recent_window=get_setting_int(self._conn, "recent_window", 50),
-            progress=progress,
-        )
+        # The rebuild issues its own BEGIN IMMEDIATE ... COMMIT and rewrites the
+        # derived tables in several statements.  It must never interleave with
+        # the scan loop's incremental learning writes (the lock documented in
+        # __init__), otherwise a concurrent commit can finalise the rebuild's
+        # transaction half-written.  The scan loop therefore waits here.
+        with self._model_lock:
+            result = recalculate_app_brain(
+                self._conn,
+                algorithm_version=self._get_setting("algorithm_version", "1.0"),
+                pattern_lengths=self._pattern_lengths(),
+                recent_window=get_setting_int(self._conn, "recent_window", 50),
+                progress=progress,
+            )
         self._reload_model()
         if result.get("ok"):
             self.status_updated.emit(
@@ -1000,9 +1010,21 @@ class MonitoringEngine(QObject):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _operational_error(self) -> None:
+    def _operational_error(self, exc: Optional[BaseException] = None) -> None:
+        """Count a scan-loop failure and tell the dashboard what really failed.
+
+        The message used to be a fixed string that threw away ``exc``, so the
+        dashboard could only ever say "Operational error during scanning" with
+        no hint of the cause.  The exception type and text are now included so
+        the status bar is actually diagnostic.
+        """
         self._counters["operational_errors"] += 1
-        self.error_occurred.emit("Operational error during scanning")
+        if exc is None:
+            message = "Operational error during scanning"
+        else:
+            message = (f"Operational error during scanning: "
+                       f"{type(exc).__name__}: {exc}")
+        self.error_occurred.emit(message)
 
     def _get_setting(self, key: str, default: str) -> str:
         if self._conn is None:

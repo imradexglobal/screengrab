@@ -19,7 +19,11 @@ if str(ROOT_DIR) not in sys.path:
 from PySide6.QtWidgets import QApplication
 from src.ui.main_window import MainWindow
 
-# Configure logging
+# Configure logging.
+#
+# Both a stream and a *file* handler: the scan loop's real exception text used
+# to go to stdout only, which is lost when the app is started from a .bat, so a
+# "Operational error during scanning" in the dashboard could not be diagnosed.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -27,6 +31,15 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
+
+try:
+    _file_handler = logging.FileHandler(
+        ROOT_DIR / "screen_monitor.log", encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    logging.getLogger().addHandler(_file_handler)
+except Exception:  # noqa: BLE001 - never let logging break app startup
+    pass
 
 logger = logging.getLogger("ScreenMonitor")
 
