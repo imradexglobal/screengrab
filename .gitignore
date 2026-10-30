@@ -1,0 +1,88 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+ENV/
+
+# ---- Test / coverage / tooling ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+coverage.xml
+
+# ---- Environment & secrets ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- PyInstaller build output ----
+build/
+dist/
+*.manifest
+
+# NOTE: ScreenMonitor.spec is intentionally NOT ignored -
+# keep it in git so the exe can be rebuilt the same way.
+
+# ---- Runtime data ----
+# SQLite database written by the app (recreated via src/database/init_db.py)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# App-generated files
+output.txt
+*.log
+backups/
+_exe_check/
+
+# ---- Local installers / binaries ----
+python_installer.exe
+*.exe
+*.msi
+*.zip
+*.7z
+
+# ---- Scratch / debug probes (root-level underscore files) ----
+# Leading "/" anchors these to the repo root so they do NOT
+# accidentally match src/**/__init__.py and friends.
+/_*.py
+/_*.png
+/_*.jpg
+/_*.svg
+/_temp.txt
+/_ui_shots/
+
+# ---- OS / editor noise ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+ehthumbs.db
+*.lnk
+
+# VS Code / editors
+.vscode/
+.idea/
+*.swp
+*.swo

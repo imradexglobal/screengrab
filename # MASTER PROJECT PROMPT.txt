@@ -1,0 +1,957 @@
+# MASTER PROJECT PROMPT
+# UPGRADE EXISTING WINDOWS SCREEN NUMBER MONITOR
+## Target: Windows Desktop Application (.EXE)
+
+## 1. ROLE AND OBJECTIVE
+
+Act as a senior Windows desktop software engineer, application architect, OCR engineer, database engineer, statistical learning engineer, automation engineer, QA engineer, and release engineer.
+
+I already have a Windows desktop application that performs some functions similar to a screen number monitor, but its current implementation is not good enough.
+
+Your task is to **inspect, understand, upgrade, and improve the existing application** using the detailed functional specification below.
+
+This is an enhancement project, not a greenfield project.
+
+The final product must remain a Windows desktop application that can be built, installed, and executed as a Windows `.exe`.
+
+Do not convert it to Android. Do not replace it with a web application. Do not create a separate application unless there is a compelling technical reason that you explain and I approve.
+
+The Android specification is the source of the required business logic, learning behavior, safety rules, and feature set. Adapt those requirements to Windows desktop technology rather than copying Android-specific implementation details.
+
+## 2. ABSOLUTE DEVELOPMENT RULES
+
+1. Inspect the existing project before writing or changing code.
+2. Identify the actual programming language, framework, database, architecture, dependencies, and packaging method.
+3. Preserve working features and existing business logic wherever possible.
+4. Do not assume that the existing app uses Python, C#, Electron, Java, SQLite, or any other specific technology.
+5. Do not rewrite the application from scratch merely because you prefer a different framework.
+6. Do not change the framework, database, application identity, or packaging approach without a documented technical reason and my approval.
+7. Do not delete, truncate, replace, or reset the existing database.
+8. Back up the database and establish a recoverable source-code checkpoint before risky migrations.
+9. Do not break existing settings, saved readings, user configurations, or working automation.
+10. Do not implement all features in a single pass.
+11. Work in clearly defined, independently testable phases.
+12. Do not start a later phase without my authorization.
+13. Do not introduce unnecessary dependencies or network services.
+14. Do not leave nonfunctional buttons, fake statistics, placeholder business logic, or simulated success messages in production code.
+15. Do not claim a successful build or test unless it was actually executed.
+16. Do not claim the `.exe` is ready if packaging or execution has not been verified.
+17. If the existing implementation conflicts with a requirement below, explain the conflict and propose a migration path.
+18. If a requirement is ambiguous, inspect the existing behavior and ask only the essential question before making an irreversible decision.
+19. Keep the code maintainable, compact where appropriate, and compatible with the existing development environment.
+20. Every phase must end with a report and a stop for approval.
+
+## 3. PHASE 0: INSPECT THE EXISTING APPLICATION
+
+Begin with inspection only. Do not modify source code, settings, or the database during this phase.
+
+Inspect:
+
+- Project directory structure
+- Application entry point
+- Main window and navigation
+- Current monitoring implementation
+- Screen capture mechanism
+- Region selection and coordinate storage
+- OCR engine and number parsing
+- Existing numerical ranges and group labels
+- Existing learning or prediction logic
+- Existing click automation
+- Current confidence or accuracy calculations
+- Existing database and data models
+- Current reading history and logs
+- Background threads, tasks, workers, or services
+- Existing settings and configuration storage
+- Error handling and logging
+- Dependencies and package versions
+- Existing tests and build tools
+- Current `.exe` packaging process
+- Installer or distribution configuration, if present
+
+Determine whether the app already supports:
+- Selecting a screen region
+- Repeated screen monitoring
+- OCR and number validation
+- Saving readings to a database
+- Saving on change versus saving every reading
+- Assigning categories to values
+- Learning numerical category sequences
+- Recording predictions and their actual outcomes
+- Selecting categories allowed to trigger clicks
+- Setting confidence thresholds
+- Calibrating a click location
+- Running while minimized
+- Rebuilding the model from historical readings
+
+Establish a baseline:
+- Does the application start?
+- Does it currently build or package?
+- Which features actually work?
+- Which features are broken or incomplete?
+- What database files exist?
+- What data-loss risks exist?
+- Which tests currently pass or fail?
+
+Use the project's actual tooling. If the available environment cannot build the app, state the limitation and give the exact commands needed on the Windows development machine.
+
+### Phase 0 deliverables
+
+Return:
+1. Project architecture summary.
+2. Existing feature inventory.
+3. Known bugs and limitations.
+4. Database and data-preservation assessment.
+5. Baseline build/test results.
+6. Recommended technical improvements.
+7. Exact files likely to change.
+8. A phase-by-phase implementation plan.
+9. Compatibility and migration risks.
+
+**Stop after Phase 0. Make no code changes and wait for my approval.**
+
+## 4. APPLICATION PURPOSE
+
+Improve the existing application so that it can:
+
+1. Monitor a user-selected rectangular area of the Windows desktop.
+2. Capture screen content at a configurable interval.
+3. Recognize numerical values using OCR.
+4. Store valid readings locally in a persistent database.
+5. Assign each accepted number to an editable numerical category.
+6. Learn category patterns of lengths 4, 5, 6, 7, and 8.
+7. Generate predictions as soon as enough prior observations exist.
+8. Evaluate predictions against subsequent actual outcomes.
+9. Calculate empirical confidence, evidence counts, and recent performance.
+10. Optionally click a configured desktop coordinate when every required safety condition passes.
+11. Rebuild derived learning information through a **Recalculate App Brain** button.
+12. Run reliably while minimized, without freezing the user interface.
+13. Preserve existing data and working functionality.
+14. Package the improved application into a working Windows `.exe`.
+
+Keep the core functionality local. Do not add cloud storage, remote accounts, subscriptions, or telemetry unless explicitly approved.
+
+## 5. REGION ARCHITECTURE
+
+There must be exactly two region slots.
+
+### Region A: Active region
+
+Region A is the only active region for the initial release.
+
+It provides the readings used for:
+- Reading history
+- Category assignment
+- Learning
+- Predictions
+- Prediction outcome verification
+- Pattern statistics
+- Confidence and accuracy
+- The 1,000-record click gate
+- Automated-click decisions
+
+Allow the user to select, resize, reposition, and recalibrate Region A.
+
+### Region B: Reserved region
+
+Region B is reserved for a future update.
+
+For the current release:
+- Do not feed its readings into learning.
+- Do not generate predictions from it.
+- Do not trigger clicks from it.
+- Do not include its records in Region A's 1,000-record count.
+- Do not allow it to affect Region A's statistics.
+
+Display Region B as reserved or inactive if it appears in the UI.
+
+Do not create Region C or additional region slots.
+
+## 6. WINDOWS SCREEN CAPTURE
+
+Adapt the screen-capture implementation to the existing Windows framework.
+
+Choose the least disruptive reliable approach compatible with the actual project. Depending on the current stack, appropriate options may include supported Windows capture APIs, Windows Graphics Capture, Desktop Duplication, or a compatible screen-capture library.
+
+Do not adopt a new capture framework without evaluating the existing implementation first.
+
+Requirements:
+
+1. Capture the intended desktop content.
+2. Crop the selected Region A rectangle accurately.
+3. Allow the user to select and recalibrate the region.
+4. Store coordinates and dimensions persistently.
+5. Handle screen resolution and display scaling changes.
+6. Handle multiple monitors and identify the display containing the selected region.
+7. Account for Windows DPI scaling when translating logical UI coordinates to physical screen coordinates.
+8. Detect when saved coordinates become invalid.
+9. Support a configurable monitoring interval.
+10. Prevent overlapping capture/OCR jobs.
+11. Dispose of captured images and native resources correctly.
+12. Keep capture and OCR work off the UI thread.
+13. Display monitoring status and capture errors.
+14. Provide Start Monitoring and Stop Monitoring controls.
+15. Handle display changes, minimized windows, and capture failures safely.
+
+Do not promise capture of protected or inaccessible content. Respect Windows permissions and operating-system restrictions.
+
+If capture becomes invalid or the expected target window cannot be verified, suspend automated clicks.
+
+## 7. OCR AND NUMBER VALIDATION
+
+Reuse the current OCR engine if it is reliable. If it is not, evaluate a suitable local OCR option compatible with the existing framework.
+
+Possible options, depending on the project, include Windows OCR APIs, Tesseract, or a compatible on-device/local OCR library.
+
+Do not introduce an external OCR service that uploads screenshots without my explicit authorization.
+
+The pipeline must:
+
+1. Capture the Region A image.
+2. Crop and preprocess it if needed.
+3. Recognize text.
+4. Preserve the raw recognized text.
+5. Parse the intended numeric value.
+6. Normalize the value for display to two decimal places.
+7. Validate the numeric value.
+8. Assign a category only when the reading is valid and covered by the configured ranges.
+9. Save the accepted reading according to the selected save mode.
+10. Update the learning engine incrementally.
+
+Distinguish:
+- Valid numeric reading
+- Empty OCR result
+- OCR failure
+- Invalid numeric text
+- Ambiguous or multiple candidate numbers
+- Value outside configured ranges
+- Quality-based rejection
+- Duplicate reading skipped by save-on-change
+
+Never convert OCR failure to zero.
+
+Do not overwrite the previous valid value when OCR fails.
+
+Do not fabricate OCR confidence if the chosen engine does not provide a comparable metric.
+
+Record errors and diagnostics separately from valid readings.
+
+Ensure that concurrent OCR operations cannot create duplicate or incorrectly ordered readings.
+
+## 8. SAVE MODES AND DATA STORAGE
+
+Provide two save modes.
+
+### Mode A: Save only when the accepted value changes
+
+Save a valid Region A reading only when its normalized numerical value differs from the previous accepted reading.
+
+Use a consistent precision strategy. Do not compare unreliable formatted strings or unrounded floating-point representations.
+
+OCR failures must not affect the comparison.
+
+### Mode B: Save every valid reading
+
+Save every accepted, valid Region A reading, including repeated values.
+
+In both modes, preserve:
+- Stable reading ID
+- Timestamp
+- Original numeric value
+- Two-decimal display value
+- Raw OCR text
+- OCR/quality metadata where available
+- Region ID
+- Assigned category or unclassified status
+- Range configuration version
+- Relevant capture/calibration metadata
+
+Use the existing database if it is suitable. If a migration is necessary, preserve all existing data and provide a tested rollback or recovery plan.
+
+A local SQLite database is acceptable if it fits the existing stack. Do not migrate from an existing suitable database simply for preference.
+
+Do not use a volatile in-memory list as the only source of truth.
+
+## 9. NUMERICAL RANGES AND GROUPS
+
+Provide these initial default groups:
+
+| Group | Lower boundary | Upper boundary |
+|---|---:|---:|
+| 1 | 1.00 | 1.25 |
+| 2 | 1.26 | 1.50 |
+| 3 | 1.51 | 2.00 |
+| 4 | 2.01 | 2.50 |
+| 5 | 2.51 | 5.00 |
+| 6 | 5.01 | 10.00 |
+| 7 | 10.01 | 24.00 |
+| 8 | 24.01 | 100.00 |
+| 9 | Greater than 100.00 | No upper limit |
+
+Values below 1.00 are unclassified by default and must not enter the nine-group learning sequence unless the user explicitly configures supported coverage.
+
+The user must be able to edit group names, abbreviations, and boundaries.
+
+Names such as Nano, Micro, Mini, Small, Medium, Large, Mega, Super, and Ultra are examples, not fixed requirements.
+
+Abbreviations must be unique.
+
+Validate all boundaries and reject overlapping or invalid configurations. Do not silently assign a reading to the wrong category.
+
+Use consistent precision rules for comparisons.
+
+Preserve raw numeric values if ranges change.
+
+After a range change, mark the learning model as stale and block automated clicks until a successful recalculation completes.
+
+Do not automatically destroy or overwrite historical reading data when categories are renamed or boundaries change.
+
+## 10. LEARNING ENGINE
+
+Implement an incremental statistical pattern-learning engine. Reuse existing learning logic if it is correct and can be improved safely.
+
+Support patterns of lengths:
+- 4 categories
+- 5 categories
+- 6 categories
+- 7 categories
+- 8 categories
+
+For example:
+
+S, N, N, B
+
+The engine should learn which next category historically followed a pattern and record how often each candidate outcome occurred.
+
+Track:
+- Pattern length
+- Pattern sequence
+- Candidate next group
+- Observed opportunities
+- Resolved predictions
+- Correct predictions
+- Incorrect predictions
+- Empirical accuracy
+- Recent performance, where enabled
+- Relevant timestamps
+- Model version
+
+Learning must start from the beginning of the dataset.
+
+**Do not wait for 1,000 readings before learning or predicting.**
+
+Once enough prior categories exist, the model must start making predictions. For example, a four-category pattern becomes available after four eligible prior category observations.
+
+The 1,000-record rule applies only to automated clicking.
+
+### Correct prediction timing
+
+Every prediction must be created using only information available at the prediction time.
+
+When the next accepted category arrives:
+1. Find unresolved predictions awaiting that outcome.
+2. Compare each prediction with the actual category.
+3. Mark it correct or incorrect.
+4. Update pattern statistics.
+5. Generate new predictions based on the currently available history.
+
+Do not use future readings to calculate historical prediction confidence.
+
+Keep individual prediction events in persistent storage.
+
+Learning continues even when:
+- Automated clicking is disabled.
+- The prediction does not qualify for clicking.
+- The predicted category is not selected for clicking.
+- Fewer than 1,000 valid records exist.
+
+### Pattern selection
+
+Do not automatically assume the longest pattern is best.
+
+Shorter patterns may have more evidence. Longer patterns may be more specific but have less evidence.
+
+Use a documented, deterministic strategy to select a candidate prediction from available patterns.
+
+If competing patterns conflict and no candidate meets the defined selection criteria, report no eligible prediction rather than inventing certainty.
+
+The statistical engine must be independently testable without requiring actual screen capture or mouse clicks.
+
+## 11. CONFIDENCE AND EVIDENCE
+
+Default confidence threshold: 70%.
+
+The initial threshold comparison must be strictly greater than the configured threshold. Exactly 70% does not qualify when the threshold is 70%.
+
+Calculate empirical accuracy using resolved predictions only.
+
+For example, 21 correct outcomes from 30 resolved predictions equals 70% historical accuracy. It is not a guarantee of future performance.
+
+Track:
+- Correct count
+- Resolved prediction count
+- Incorrect count
+- Overall empirical accuracy
+- Recent accuracy, where enabled
+- Evidence sufficiency
+- Prediction eligibility
+
+Implement a configurable minimum evidence requirement. Suggested initial default: 30 resolved predictions for the relevant pattern/candidate pair.
+
+Implement a configurable recent-performance safeguard. Suggested initial default: recent accuracy of at least 60%, using a clearly defined recent window.
+
+These evidence and recent-performance settings may be configurable. The 1,000-record click gate must not be configurable.
+
+A candidate with insufficient evidence must not authorize a click.
+
+Preserve the confidence and evidence available at the time each individual prediction was created.
+
+## 12. MANDATORY 1,000-RECORD AUTOMATION GATE
+
+This is an absolute requirement.
+
+**No automated click may be dispatched until Region A has at least 1,000 qualifying, persisted, valid readings.**
+
+This rule is mandatory and non-editable.
+
+It must be enforced inside the automation execution path, not merely through the UI.
+
+It must not be bypassed by:
+- Enabling auto-click in settings
+- Changing the confidence threshold
+- Importing unrelated or invalid events
+- Recalculating the model
+- Restarting the app
+- Editing an ordinary setting
+- Counting Region B data
+- Counting OCR attempts
+- Counting failed or invalid readings
+- Counting predictions instead of readings
+
+Before every click, query the qualifying Region A reading count from the persistent database or a reliable transactionally maintained count.
+
+Required behavior:
+- 0 valid records: no click.
+- 999 valid records: no click.
+- 1,000 valid records: the count condition may pass, but every other safety condition must also pass.
+
+The gate must be independently unit-tested.
+
+If the existing database contains historical readings, assess them during migration. Count only records that meet the defined valid Region A criteria. Do not manufacture valid records to satisfy the threshold.
+
+## 13. AUTO-CLICK ENGINE
+
+Provide configurable desktop click automation.
+
+The user must be able to:
+- Enable or disable automated clicking.
+- Select multiple predicted categories allowed to trigger a click.
+- Configure the confidence threshold.
+- Configure minimum evidence.
+- Configure the recent-performance safeguard.
+- Configure cooldown behavior.
+- Select and recalibrate the target screen position.
+
+Use the existing automation implementation if it is reliable. Otherwise, use a suitable supported Windows input mechanism compatible with the current application.
+
+Before dispatching any click, verify every condition:
+
+1. Region A has at least 1,000 qualifying valid saved readings.
+2. Master auto-click is enabled.
+3. The model is valid and not stale.
+4. No recalculation is in progress.
+5. The predicted category is selected.
+6. Confidence is strictly above the configured threshold.
+7. Minimum evidence is satisfied.
+8. Recent-performance safeguard passes when enabled.
+9. Target coordinates are valid.
+10. Display and DPI calibration remain valid.
+11. The intended target application/window is verified when required by the current design.
+12. No duplicate click has already been dispatched for the same prediction.
+13. Cooldown has expired.
+14. No other safety condition has failed.
+
+If any condition fails, do not click.
+
+Record the reason using stable codes such as:
+- REGION_A_RECORDS_BELOW_1000
+- AUTO_CLICK_DISABLED
+- MODEL_RECALCULATION_REQUIRED
+- CATEGORY_NOT_ENABLED
+- CONFIDENCE_TOO_LOW
+- INSUFFICIENT_EVIDENCE
+- RECENT_ACCURACY_TOO_LOW
+- INVALID_TARGET_COORDINATES
+- DISPLAY_CALIBRATION_CHANGED
+- TARGET_WINDOW_NOT_VERIFIED
+- DUPLICATE_ACTION
+- COOLDOWN_ACTIVE
+- REBUILD_IN_PROGRESS
+
+Provide readable explanations in the UI.
+
+### Desktop coordinate safety
+
+Windows desktop coordinates can change because of:
+- Display resolution changes
+- Multiple monitors
+- Monitor arrangement changes
+- DPI scaling
+- Window movement
+- Browser zoom or layout changes
+
+Store calibration metadata and detect invalid or stale coordinates.
+
+Provide a clear recalibration workflow.
+
+If the target window cannot be verified or the intended screen location is uncertain, block the click.
+
+Use a dry-run mode before live clicking.
+
+Do not bypass security controls, authentication, CAPTCHAs, or application restrictions. Do not claim that a dispatched click proves the target application accepted an action.
+
+Distinguish:
+- Blocked before dispatch
+- Tap/click dispatched
+- Dispatch failed
+- Result unknown
+
+Provide a master kill switch that prevents new clicks immediately.
+
+## 14. RECALCULATE APP BRAIN
+
+Add a button labelled exactly:
+
+**Recalculate App Brain**
+
+Place it in the learning/patterns interface.
+
+This function rebuilds derived learning data from the preserved raw reading history.
+
+### Preserve original data
+
+Never delete or rewrite:
+- Original readings
+- Raw OCR text
+- Reading timestamps
+- Stable reading IDs
+- Capture metadata
+- Existing settings
+- Range configuration history
+- Click rules and coordinates
+- Historical click audit logs
+
+Rebuild derived classification, prediction, and pattern data as required.
+
+Do not pretend historical click actions were executed again during recalculation.
+
+### Required recalculation process
+
+1. Notify the user that the derived model will be rebuilt.
+2. Confirm the operation if appropriate.
+3. Immediately block new automated clicks.
+4. Record the current model and configuration versions.
+5. Obtain a consistent source-reading snapshot.
+6. Reclassify numeric readings using the current valid ranges.
+7. Replay eligible Region A readings chronologically.
+8. Generate each historical prediction before exposing the next actual outcome to the predictor.
+9. Resolve predictions when their actual subsequent outcomes become available.
+10. Recalculate pattern counts, accuracy, confidence, and recent performance.
+11. Validate the new model.
+12. Publish the new model atomically.
+13. Record model version, source count, completion time, and result.
+14. Display success or a useful error.
+
+Use transactions, staging tables, versioned derived records, or an equivalent safe approach appropriate to the existing database.
+
+Do not drop or recreate the entire database to rebuild the model.
+
+If recalculation fails:
+- Preserve the previous published model.
+- Do not publish partial results.
+- Preserve raw readings and historical click logs.
+- Keep auto-click disabled until the model is valid.
+- Show the error and allow a retry.
+
+If new readings arrive during recalculation, handle them deterministically using a snapshot and a controlled catch-up process, or pause processing safely.
+
+### Rebuild triggers
+
+Request recalculation when changes invalidate the derived model, including:
+- Range boundaries
+- Category identities that affect pattern interpretation
+- Pattern lengths
+- Prediction-selection logic
+- Confidence/evidence calculation logic
+- Historical reading imports or corrections
+- Learning algorithm changes
+
+Changing only the click location or turning auto-click on/off should not require retraining unless prediction semantics are affected.
+
+The app must show whether the current model is valid, stale, rebuilding, or failed.
+
+## 15. USER INTERFACE IMPROVEMENTS
+
+Improve the existing UI rather than redesigning it without cause.
+
+Reuse working screens and components where possible.
+
+### Dashboard
+
+Show:
+- Monitoring status
+- Start/stop controls
+- Region A latest value
+- Latest category
+- Qualifying Region A record count
+- Learning/model status
+- Latest prediction
+- Confidence and evidence
+- Auto-click status
+- Clear click-block reason
+
+Example:
+
+"Auto-click locked: 742 / 1,000 valid Region A readings."
+
+Use the actual database count.
+
+### Region configuration
+
+Show exactly Region A and Region B.
+
+Region A supports selection and recalibration.
+
+Region B remains reserved and inactive.
+
+### Reading history
+
+Show timestamp, value, category, and useful reading details.
+
+Support pagination or incremental loading for large datasets.
+
+Provide CSV export. Provide safe database backup/export if compatible with the existing app.
+
+### Learning and patterns
+
+Show:
+- Patterns of lengths 4–8
+- Candidate next categories
+- Resolved prediction counts
+- Correct and incorrect counts
+- Confidence
+- Recent performance
+- Evidence sufficiency
+- Unresolved predictions
+- Model version/state
+- Recalculate App Brain button
+
+### Automation settings
+
+Show:
+- Master enable/disable switch
+- Multi-select allowed categories
+- Confidence threshold
+- Minimum evidence
+- Recent-performance safeguard
+- Cooldown
+- Target coordinate calibration
+- Current record count
+- Click eligibility
+- Last click/block event
+
+The UI must never be the only place enforcing the 1,000-record gate.
+
+### Activity and diagnostics
+
+Show:
+- Capture and OCR errors
+- Rejected readings
+- Monitoring interruptions
+- Recalculation history
+- Click attempts
+- Blocked clicks and reasons
+- Database/export errors
+
+All visible controls must be connected to real application behavior.
+
+## 16. BACKGROUND EXECUTION AND PERFORMANCE
+
+The app must continue monitoring while minimized where the existing Windows framework and operating system permit.
+
+Use background workers, threads, tasks, or services appropriate to the actual stack.
+
+Requirements:
+- Never block the UI during capture, OCR, database operations, or recalculation.
+- Prevent overlapping monitoring jobs.
+- Dispose of image and native resources.
+- Prevent duplicate predictions and clicks after retries.
+- Preserve chronological reading order.
+- Use database transactions for related reading/prediction updates.
+- Keep CPU and memory use reasonable.
+- Paginate large histories.
+- Avoid full model rebuilds after every new reading.
+- Avoid uncontrolled in-memory caching of the entire dataset.
+- Report monitoring failures.
+- Recover safely after application restarts.
+
+Do not claim that monitoring continues after the application is closed if the current implementation only supports minimized operation.
+
+## 17. DATA MIGRATION AND BACKWARD COMPATIBILITY
+
+Existing readings and settings are valuable.
+
+Before a schema migration:
+1. Identify the current schema and data volume.
+2. Create a verified backup.
+3. Document the migration.
+4. Implement migration without destructive resets.
+5. Test migration on a copy of the existing database.
+6. Validate record counts and critical values.
+7. Preserve existing IDs where feasible.
+8. Provide a recovery path.
+
+Do not silently reinterpret old data.
+
+If existing historical readings do not contain raw OCR text or sufficient metadata, preserve what exists and document any limitation. Do not invent missing information.
+
+If the current learning model has bugs, retain its historical data as required for audit while publishing a corrected derived model through the recalculation process.
+
+## 18. TESTING REQUIREMENTS
+
+Add tests compatible with the project's current test framework.
+
+### A. Data and save-mode tests
+
+Test:
+- Valid reading persistence
+- Invalid OCR rejection
+- Save-on-change
+- Save-every-reading
+- Accurate Region A count
+- Region B excluded from the count
+- Boundary classification
+- Duplicate handling
+- Database migration
+- Transaction rollback
+
+### B. Boundary tests
+
+Test values:
+1.00, 1.25, 1.26, 1.50, 1.51, 2.00, 2.01, 2.50, 2.51, 5.00, 5.01, 10.00, 10.01, 24.00, 24.01, 100.00, values above 100.00, and values below 1.00.
+
+Test invalid, overlapping, and reversed ranges.
+
+### C. Learning tests
+
+Verify:
+- Learning starts immediately.
+- Pattern lengths 4–8 activate at the correct times.
+- Predictions are stored before actual outcomes are revealed.
+- Correct/incorrect outcomes are recorded correctly.
+- Unresolved predictions are not counted as resolved.
+- Confidence uses only available resolved evidence.
+- Incremental learning matches chronological replay.
+- Recalculating twice produces equivalent derived results from the same source snapshot.
+
+### D. Mandatory click-gate tests
+
+Verify:
+- 0 qualifying records: no click.
+- 999 qualifying records: no click.
+- 1,000 qualifying records: the count gate passes but other checks remain mandatory.
+- 1,000 OCR attempts with no valid saved readings: no click.
+- 999 Region A readings plus many Region B records: no click.
+- Auto-click enabled below 1,000: no click.
+- Stale model: no click.
+- Recalculation running: no click.
+- Invalid coordinates: no click.
+- Unverified target window: no click where target verification is required.
+- Disabled predicted category: no click.
+- Confidence exactly at the threshold: no click.
+- Insufficient evidence: no click.
+- Duplicate prediction dispatch: no duplicate click.
+
+Use a mock click dispatcher for automated tests. Never use real desktop clicks during unit tests.
+
+### E. Recalculation tests
+
+Verify:
+- Raw readings are preserved.
+- Click audit logs are preserved.
+- Historical classification changes correctly when ranges change.
+- Replay is chronological.
+- No future leakage occurs.
+- Failed rebuild leaves the previous model intact.
+- Partial derived data is never published.
+- Auto-click stays disabled after a failed rebuild.
+- Historical click actions are not recreated.
+
+### F. Windows integration tests
+
+Test:
+- Region selection and calibration
+- DPI scaling
+- Multiple displays where available
+- Screen resolution changes
+- Capture errors
+- OCR failures
+- Minimized operation
+- Stop monitoring
+- Database persistence after restart
+- Click dry-run mode
+- Packaged executable startup
+
+Document any tests that require a physical Windows desktop and cannot be run automatically.
+
+## 19. WINDOWS EXECUTABLE AND PACKAGING
+
+The final product must be a working Windows `.exe` compatible with the project's actual technology stack.
+
+Inspect the current packaging process before changing it.
+
+Depending on the current framework, use the appropriate existing packaging or publishing mechanism. Do not assume PyInstaller, MSIX, Electron Builder, ClickOnce, or any other tool until the stack has been inspected.
+
+The packaged app must:
+- Start on a supported Windows machine.
+- Include or correctly declare required runtime dependencies.
+- Access its database using a stable writable location.
+- Preserve database files across upgrades.
+- Keep configuration separate from temporary build output.
+- Handle missing permissions and capture errors.
+- Include a clear version identifier.
+- Avoid storing user data inside a temporary extraction directory.
+- Provide practical installation and update instructions.
+
+Do not place the production database in a location that will be overwritten during an app update.
+
+Test the packaged `.exe`, not only the development version.
+
+If an installer is included, test install, launch, normal use, upgrade, and uninstall behavior. Do not delete user data on uninstall unless that behavior is explicitly documented and authorized.
+
+Do not claim the executable has been generated unless the file exists and has been verified.
+
+## 20. PHASED IMPLEMENTATION PLAN
+
+### Phase 0 — Audit only
+
+Inspect the project and provide the baseline report. No code changes.
+
+### Phase 1 — Foundation and preservation
+
+- Establish source-control or backup checkpoint.
+- Confirm database backup and recovery.
+- Document current architecture.
+- Identify necessary schema changes.
+- Add or improve test infrastructure.
+- Improve the minimum required structure without breaking existing functionality.
+
+Do not implement the whole application.
+
+### Phase 2 — Screen monitoring and Region A
+
+- Improve region selection.
+- Improve screen capture.
+- Improve coordinate calibration.
+- Improve monitoring interval and start/stop controls.
+- Keep Region B reserved.
+
+### Phase 3 — OCR and data persistence
+
+- Improve OCR and number validation.
+- Implement both save modes.
+- Preserve raw readings.
+- Improve database integrity and error handling.
+- Add reading history and valid-record counts.
+
+### Phase 4 — Numerical ranges
+
+- Add or correct the nine default groups.
+- Implement editable labels and boundaries.
+- Validate ranges.
+- Mark the model stale after relevant changes.
+
+### Phase 5 — Learning and prediction
+
+- Implement or repair patterns of lengths 4–8.
+- Generate predictions immediately when enough history exists.
+- Record prediction events before outcomes.
+- Calculate evidence, accuracy, confidence, and recent performance.
+- Add the learning/patterns interface.
+
+No live clicking in this phase.
+
+### Phase 6 — Recalculate App Brain
+
+- Reclassify raw historical values as required.
+- Rebuild derived predictions and pattern statistics.
+- Replay chronologically without future leakage.
+- Use staging and atomic publication.
+- Preserve raw readings and click history.
+- Add rollback and recalculation audit records.
+
+No live clicking in this phase.
+
+### Phase 7 — Safe desktop automation
+
+- Improve coordinate calibration.
+- Add multi-select category rules.
+- Add confidence/evidence/recent-performance safeguards.
+- Add cooldown and duplicate prevention.
+- Enforce the mandatory 1,000-record gate in the execution layer.
+- Add click audit logs.
+- Start with dry-run mode.
+
+Enable real clicks only after the tests pass and I explicitly authorize live automation.
+
+### Phase 8 — Reliability and integration
+
+- Fix cross-feature issues.
+- Test long-running monitoring.
+- Test restarts and data persistence.
+- Test recalculation during active monitoring.
+- Test Windows display scaling and coordinate validity.
+- Review performance and database integrity.
+
+### Phase 9 — Package and verify the EXE
+
+- Generate the Windows executable using the existing compatible packaging approach.
+- Test the actual packaged application.
+- Verify data paths and persistence.
+- Provide installation, backup, and recovery instructions.
+- Report remaining limitations and release readiness.
+
+Stop after each phase and wait for my authorization before proceeding.
+
+## 21. REQUIRED REPORT AFTER EVERY PHASE
+
+Report:
+1. Phase number and status.
+2. Files inspected.
+3. Files created.
+4. Files modified.
+5. Existing features preserved.
+6. Features implemented.
+7. Features deferred.
+8. Database/schema changes.
+9. Dependency and configuration changes.
+10. Build/package command executed and actual result.
+11. Tests executed and actual results.
+12. Tests not executed and why.
+13. Known bugs and limitations.
+14. Data migration and backup status.
+15. Manual testing instructions.
+16. Exact next phase proposed.
+
+Do not automatically proceed to the next phase.
+
+## 22. FINAL INSTRUCTION
+
+Start with **Phase 0 and complete to the end  but keep a todo list**.
+
+Inspect the existing desktop application and establish its baseline. Do not change code, database records, settings, or packaging configuration.
+
+Return a technically detailed report and a phased plan tailored to the actual project.
+
+Dont stop and wait for my approval.
+
+The target remains a Windows desktop application distributed as a `.exe`. Do not convert the project to Android, do not replace the existing application wholesale, and implement all phases in one by one.
