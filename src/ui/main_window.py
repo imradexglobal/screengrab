@@ -633,6 +633,208 @@ class RegionBorderOverlay(QWidget):
         painter.drawRect(self._frame.adjusted(-half, -half, half, half))
 
 
+class ClickSpotOverlay(QWidget):
+    """Always-on-top overlay that paints numbered green dots at each calibrated click target.
+
+    One instance covers the whole virtual screen and redraws whenever the target
+    list changes.  Like ``RegionBorderOverlay`` it is fully transparent to mouse
+    input and never steals focus.  It is also excluded from screen captures so
+    the dots never appear inside an OCR frame.
+    """
+
+    DOT_RADIUS = 7        # half-size of the green filled circle
+    BORDER_WIDTH = 3       # thickness of the white/dark ring around the dot
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._points: List[tuple] = []   # list of (logical_x, logical_y)
+        self._affinity_applied = False
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+            | Qt.WindowTransparentForInput
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.NoFocus)
+
+        # Cover the full virtual desktop so dots on any monitor are reachable.
+        from PySide6.QtGui import QGuiApplication
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            geo = screen.virtualGeometry()
+            self.setGeometry(geo)
+        else:
+            self.setGeometry(0, 0, 3840, 2160)  # safe fallback
+
+    # ------------------------------------------------------------------
+    def set_points(self, physical_points: List[tuple]) -> None:
+        """Update the dot positions from *physical* pixel coordinates.
+
+        ``physical_points`` is a list of ``(px, py)`` tuples as stored in the
+        database.  They are converted to Qt logical coordinates here.
+        """
+        logical = []
+        for px, py in physical_points:
+            lx, ly, _, _ = physical_rect_to_logical(int(px), int(py), 1, 1)
+            # Adjust for our widget's own top-left offset (virtual geo origin).
+            geo = self.geometry()
+            logical.append((lx - geo.x(), ly - geo.y()))
+        self._points = logical
+        if logical:
+            if not self.isVisible():
+                self.show()
+                self._apply_capture_exclusion()
+            self.raise_()
+        else:
+            self.hide()
+        self.update()
+
+    def clear(self) -> None:
+        """Remove all dots and hide the overlay."""
+        self._points = []
+        self.hide()
+
+    def _apply_capture_exclusion(self) -> None:
+        """Exclude this window from Windows screen-capture APIs."""
+        if self._affinity_applied:
+            return
+        self._affinity_applied = True
+        try:
+            import ctypes, ctypes.wintypes, sys
+            if sys.platform != "win32":
+                return
+            WDA_EXCLUDEFROMCAPTURE = 0x00000011
+            ctypes.windll.user32.SetWindowDisplayAffinity(
+                ctypes.wintypes.HWND(int(self.winId())),
+                WDA_EXCLUDEFROMCAPTURE)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not exclude ClickSpotOverlay from capture: %s", exc)
+
+    def paintEvent(self, event):  # noqa: N802
+        if not self._points:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        r = self.DOT_RADIUS
+        font = QFont()
+        font.setPointSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+
+        for index, (lx, ly) in enumerate(self._points, start=1):
+            cx, cy = lx, ly
+
+            # Outer dark ring for contrast against any background.
+            painter.setPen(QPen(QColor(0, 0, 0, 180), self.BORDER_WIDTH + 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+
+            # Green filled circle — same green as the Region A border.
+            painter.setPen(QPen(QColor(34, 197, 94), self.BORDER_WIDTH))
+            painter.setBrush(QColor(34, 197, 94))
+            painter.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+
+            # White number label centred inside the dot.
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(cx - r, cy - r, r * 2, r * 2, Qt.AlignCenter, str(index))
+
+
+class PredictionHUDOverlay(QWidget):
+    """Always-on-top floating label that shows the latest prediction stats.
+
+    Displayed just below the Region A green border, it mirrors the same
+    "confidence / resolved / len" line shown on the Dashboard so the user can
+    watch it without switching pages.  Like the border overlay it never steals
+    focus and is transparent to mouse events.
+    """
+
+    _STYLE = (
+        "background-color: rgba(15, 23, 42, 210);"
+        "color: #e2f8ea;"
+        "border: 1px solid #22c55e;"
+        "border-radius: 6px;"
+        "font-size: 9pt;"
+        "font-weight: 600;"
+        "padding: 3px 8px;"
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._affinity_applied = False
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+            | Qt.WindowTransparentForInput
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.NoFocus)
+
+        self._label = QLabel("—", self)
+        self._label.setStyleSheet(self._STYLE)
+        self._label.setWordWrap(True)
+        self._label.adjustSize()
+
+        self._region_bottom_logical: Optional[tuple] = None  # (x, y, w) below border
+
+    # ------------------------------------------------------------------
+    def anchor_below_region(self, lx: int, ly: int, lw: int, lh: int) -> None:
+        """Position the HUD just below the Region A border in logical coords."""
+        pad = RegionBorderOverlay.PADDING + RegionBorderOverlay.BORDER_WIDTH
+        hud_x = lx - pad
+        hud_y = ly + lh + pad + 4  # 4 px gap below the border
+        self._region_bottom_logical = (hud_x, hud_y, lw + pad * 2)
+        self._reposition()
+
+    def _reposition(self) -> None:
+        if self._region_bottom_logical is None:
+            return
+        hud_x, hud_y, max_w = self._region_bottom_logical
+        self._label.adjustSize()
+        w = min(self._label.sizeHint().width() + 20, max(max_w, 200))
+        h = self._label.sizeHint().height() + 8
+        self.setGeometry(hud_x, hud_y, w, h)
+        self._label.setGeometry(0, 0, w, h)
+
+    def update_text(self, text: str) -> None:
+        """Set the HUD label text and keep geometry in sync."""
+        self._label.setText(text)
+        if self._region_bottom_logical is not None:
+            self._reposition()
+        if text and text != "—":
+            if not self.isVisible():
+                self.show()
+                self._apply_capture_exclusion()
+            self.raise_()
+        self.update()
+
+    def hide_hud(self) -> None:
+        self.hide()
+
+    def _apply_capture_exclusion(self) -> None:
+        if self._affinity_applied:
+            return
+        self._affinity_applied = True
+        try:
+            import ctypes, ctypes.wintypes, sys
+            if sys.platform != "win32":
+                return
+            WDA_EXCLUDEFROMCAPTURE = 0x00000011
+            ctypes.windll.user32.SetWindowDisplayAffinity(
+                ctypes.wintypes.HWND(int(self.winId())),
+                WDA_EXCLUDEFROMCAPTURE)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not exclude PredictionHUDOverlay from capture: %s", exc)
+
+
 class DashboardWidget(QWidget):
     """Dashboard widget showing live monitoring status, controls, and recent detections."""
 
@@ -1235,6 +1437,8 @@ class RegionsWidget(QWidget):
         self._border_overlay_b = RegionBorderOverlay()
         self._border_visible_a = False
         self._border_visible_b = False
+        #: Floating HUD that shows the latest prediction stats below Region A.
+        self._prediction_hud = PredictionHUDOverlay()
         self._setup_ui()
         self.refresh()
 
@@ -1347,6 +1551,10 @@ class RegionsWidget(QWidget):
         self._region_b_timer.timeout.connect(self._refresh_region_b_stats)
         self._region_b_timer.start()
 
+        # Wire the prediction signal so the HUD stays up to date.
+        if self.engine:
+            self.engine.prediction_made.connect(self._on_prediction_made_hud)
+
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
@@ -1385,6 +1593,19 @@ class RegionsWidget(QWidget):
         else:
             self.region_b_latest.setText("—")
 
+    @Slot(dict)
+    def _on_prediction_made_hud(self, prediction: dict) -> None:
+        """Update the always-on-top HUD when a new prediction arrives."""
+        group = _group_label(self.engine, prediction.get("candidate_group"))
+        conf = float(prediction.get("confidence") or 0.0)
+        resolved = int(prediction.get("resolved_count") or 0)
+        plen = prediction.get("pattern_length", "?")
+        text = (
+            f"Pred: {group} — conf {conf:.1f}%  "
+            f"(resolved {resolved}, len {plen})"
+        )
+        self._prediction_hud.update_text(text)
+
     def _sync_borders(self, regions: Dict[str, dict]):
         """Keep the always-on-top green frames over the capture areas."""
         self._sync_one_border(
@@ -1409,12 +1630,20 @@ class RegionsWidget(QWidget):
             if visible:
                 overlay.hide()
                 setattr(self, visibility_attr, False)
+            # Hide the HUD when Region A disappears.
+            if slot_id == REGION_A_ID:
+                self._prediction_hud.hide_hud()
             return
         try:
-            overlay.show_physical_rect(
-                int(region["x"]), int(region["y"]),
-                int(region["width"]), int(region["height"]))
+            rx, ry = int(region["x"]), int(region["y"])
+            rw, rh = int(region["width"]), int(region["height"])
+            overlay.show_physical_rect(rx, ry, rw, rh)
             setattr(self, visibility_attr, True)
+            # Anchor the prediction HUD just below the Region A border.
+            if slot_id == REGION_A_ID:
+                from src.capture.screen_capture import physical_rect_to_logical
+                lx, ly, lw, lh = physical_rect_to_logical(rx, ry, rw, rh)
+                self._prediction_hud.anchor_below_region(lx, ly, lw, lh)
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Could not display the {slot_id} border: {exc}")
 
@@ -2648,6 +2877,8 @@ class AutomationWidget(QWidget):
         super().__init__(parent)
         self.engine = engine
         self._group_ids: List[str] = []
+        #: Always-on-top overlay that marks calibrated click targets with numbered dots.
+        self._click_spot_overlay = ClickSpotOverlay()
         self._setup_ui()
         self._load_settings()
         self.refresh_status()
@@ -2917,6 +3148,9 @@ class AutomationWidget(QWidget):
             self.calibration_label.setText(
                 "Not calibrated - clicks are blocked until at least one point is set.")
 
+        # Keep the on-screen dots in sync with the loaded targets.
+        self._refresh_click_spot_overlay()
+
     # --- point-sequence editing -----------------------------------------
     def _add_point_row(self, x: int = 0, y: int = 0) -> None:
         """Append an editable point row (defaults to 0,0)."""
@@ -2948,6 +3182,12 @@ class AutomationWidget(QWidget):
             if item is not None:
                 item.setText(str(row + 1))
 
+    def _refresh_click_spot_overlay(self) -> None:
+        """Sync the numbered-dot overlay with the current physical-pixel point list."""
+        points = [(p["x"], p["y"]) for p in self._collect_points()
+                  if p["x"] > 0 or p["y"] > 0]
+        self._click_spot_overlay.set_points(points)
+
     def _set_points(self, points) -> None:
         """Replace the whole sequence with ``points`` (iterable of (x, y))."""
         self.targets_table.setRowCount(0)
@@ -2974,10 +3214,12 @@ class AutomationWidget(QWidget):
         for row in rows:
             self.targets_table.removeRow(row)
         self._reindex_points()
+        self._refresh_click_spot_overlay()
 
     def _clear_points(self) -> None:
         self.targets_table.setRowCount(0)
         self._reindex_points()
+        self._click_spot_overlay.clear()
 
     # ------------------------------------------------------------------
     def _use_cursor_position(self):
@@ -3008,6 +3250,9 @@ class AutomationWidget(QWidget):
         self.calibration_label.setText(
             f"{total} point{'s' if total != 1 else ''} set; latest ({px}, {py}) "
             f"on {mon} at {datetime.now().isoformat()}")
+
+        # Show / refresh the numbered dot immediately after picking.
+        self._refresh_click_spot_overlay()
 
     def _set_target_coordinates(self, logical_x: int, logical_y: int):
         """Backward-compatible single-point setter used by older callers/tests."""
