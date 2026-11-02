@@ -2747,7 +2747,12 @@ class LearningWidget(QWidget):
         raw = [t for t in text.replace(",", " ").replace(";", " ").split() if t]
 
         if kind == "movement":
-            tokens = [normalise_movement(t) for t in raw]
+            tokens = []
+            for t in raw:
+                if t == "?":
+                    tokens.append("?")
+                else:
+                    tokens.append(normalise_movement(t))
         else:
             conn = self.engine._conn if self.engine else None
             groups = config_repo.load_groups(conn) if conn is not None else []
@@ -2756,22 +2761,24 @@ class LearningWidget(QWidget):
                         for g in groups}
             tokens = []
             for token in raw:
-                if token in by_id:
+                if token == "?":
+                    tokens.append("?")
+                elif token in by_id:
                     tokens.append(token)
-                    continue
-                try:
-                    value = float(token)
-                except (TypeError, ValueError):
-                    raise ValueError(
-                        f"'{token}' is not a configured range. Use one of: "
-                        f"{self._range_options_text() or 'the group ids'}.")
-                key = f"{value:.2f}"
-                if key not in by_bound:
-                    raise ValueError(
-                        f"{key} is not the lower bound of any configured "
-                        f"range. Available ranges: "
-                        f"{self._range_options_text() or 'none'}.")
-                tokens.append(by_bound[key])
+                else:
+                    try:
+                        value = float(token)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"'{token}' is not a configured range. Use one of: "
+                            f"{self._range_options_text() or 'the group ids'}.")
+                    key = f"{value:.2f}"
+                    if key not in by_bound:
+                        raise ValueError(
+                            f"{key} is not the lower bound of any configured "
+                            f"range. Available ranges: "
+                            f"{self._range_options_text() or 'none'}.")
+                    tokens.append(by_bound[key])
 
         if not (MIN_PATTERN_LENGTH <= len(tokens) <= MAX_PATTERN_LENGTH):
             raise ValueError(
