@@ -100,11 +100,17 @@ def evaluate_candidates(
     min_confidence: float,
     mode: str = MODE_ON_CHANGE,
     previous_canonical: Optional[str] = None,
+    require_range: bool = True,
 ) -> Evaluation:
     """Validate the OCR candidates of a single region.
 
     ``candidates`` are dicts produced by :meth:`OCREngine.process`, each with
     ``text``, ``confidence`` and ``canonical_value``.
+
+    When ``require_range`` is ``False`` (Region B) the configured ranges are
+    ignored entirely: any confidently parsed number is accepted and stored with
+    ``group_id = None``.  Non-numeric, ambiguous and low-confidence frames are
+    still rejected.
 
     Exactly one :class:`Evaluation` is returned; the caller stores a reading only
     when :attr:`Evaluation.is_valid` is true.
@@ -162,7 +168,7 @@ def evaluate_candidates(
         )
 
     group_id = range_config.classify(numeric) if range_config is not None else None
-    if group_id is None:
+    if require_range and group_id is None:
         return Evaluation(
             status=OUT_OF_RANGE,
             detail=f"{canonical} is outside every configured group",
@@ -170,6 +176,10 @@ def evaluate_candidates(
             original_text=chosen.get("text"),
             ocr_confidence=float(chosen.get("confidence") or 0.0),
         )
+    if not require_range:
+        # Region B is store-only: the number is kept but deliberately has no
+        # category, so it can never influence the Region A model or gate.
+        group_id = None
 
     # 4) Save mode: "on change" suppresses an immediate repeat.
     if mode == MODE_ON_CHANGE and previous_canonical is not None \

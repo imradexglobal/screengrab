@@ -35,6 +35,7 @@ from src.config.repository import (
     get_setting_int,
     load_range_config,
     mark_model_stale,
+    set_setting,
 )
 from src.database.init_db import (
     DB_PATH,
@@ -46,7 +47,8 @@ from src.database.init_db import (
     initialise_database,
 )
 from src.learning import repository as learn_repo
-from src.learning.patterns import DEFAULT_PATTERN_LENGTHS, LearningEngine
+from src.learning.manual_brain import ManualBrain
+from src.learning.patterns import DEFAULT_PATTERN_LENGTHS
 from src.learning.rebuild import recalculate_app_brain
 from src.monitor import pipeline
 from src.ocr.engine import OCREngine
@@ -84,13 +86,14 @@ class MonitoringEngine(QObject):
     prediction_resolved = Signal(dict)
     click_event = Signal(dict)       # new: a click decision (blocked or not)
     counters_updated = Signal(dict)
+    patterns_changed = Signal()      # user added/deleted/enabled a pattern
 
     def __init__(self, parent: Optional[QObject] = None, db_path: Optional[str] = None):
         super().__init__(parent)
         self.db_path = db_path or DB_PATH
         self._conn: Optional[sqlite3.Connection] = None
         self._ocr: Optional[OCREngine] = None
-        self._learner: Optional[LearningEngine] = None
+        self._learner: Optional[ManualBrain] = None
         self._auto_click: Optional[AutoClickEngine] = None
         self._range_config = None
         self._model_version = 0
@@ -147,18 +150,17 @@ class MonitoringEngine(QObject):
             return False
 
     def _reload_model(self) -> None:
-        """Refresh range configuration and rehydrate the learning engine."""
+        """Refresh range configuration and rehydrate the manual pattern brain."""
         if self._conn is None:
             return
         with self._model_lock:
             self._range_config = load_range_config(self._conn)
             self._model_version = current_model_version(self._conn)
-            lengths = self._pattern_lengths()
-            self._learner = learn_repo.load_engine_state(
+            definitions = learn_repo.enabled_pattern_definitions(self._conn)
+            self._learner = learn_repo.load_manual_brain(
                 self._conn,
                 self._model_version,
-                abbreviation_fn=self._range_config.abbreviation,
-                pattern_lengths=lengths,
+                definitions,
                 recent_window=get_setting_int(self._conn, "recent_window", 50),
                 region_id=REGION_A_ID,
             )
@@ -607,12 +609,19 @@ class MonitoringEngine(QObject):
             previous_canonical = (
                 previous["canonical_value"] if previous is not None else None)
 
+            # Region B ignores the configured ranges entirely: it stores any
+            # confidently parsed number (including 0.00) with no group.  It
+            # still rejects non-numeric, ambiguous or low-confidence frames.
+            require_range = region_id != REGION_B_ID
+            mode = self._save_mode() if require_range else self._region_b_save_mode()
+
             evaluation = pipeline.evaluate_candidates(
                 candidates,
                 self._range_config,
                 min_confidence=float(self._get_setting("min_ocr_confidence", "70")),
-                mode=self._save_mode(),
+                mode=mode,
                 previous_canonical=previous_canonical,
+                require_range=require_range,
             )
 
             if not evaluation.is_valid:
@@ -630,6 +639,12 @@ class MonitoringEngine(QObject):
         mode = self._get_setting("save_mode", pipeline.MODE_ON_CHANGE)
         return mode if mode in (pipeline.MODE_ON_CHANGE, pipeline.MODE_EVERY) \
             else pipeline.MODE_ON_CHANGE
+
+    def _region_b_save_mode(self) -> str:
+        """Region B defaults to storing every scan so nothing is lost."""
+        mode = self._get_setting("region_b_save_mode", pipeline.MODE_EVERY)
+        return mode if mode in (pipeline.MODE_ON_CHANGE, pipeline.MODE_EVERY) \
+            else pipeline.MODE_EVERY
 
     def _accept(self, region_id: str, region: Dict[str, Any],
                 evaluation: pipeline.Evaluation) -> None:
@@ -722,7 +737,8 @@ class MonitoringEngine(QObject):
 
         # Learning (Region A only) - immediate, no warm-up.
         if region_id == REGION_A_ID and evaluation.group_id:
-            self._learn(evaluation.group_id, reading_id, now)
+            self._learn(evaluation.group_id, evaluation.numeric_value,
+                        reading_id, now)
         self.counters_updated.emit(self.counters())
 
     def _reject(self, region_id: str, status: str, detail: str,
@@ -762,21 +778,25 @@ class MonitoringEngine(QObject):
     # Learning + automation
     # ------------------------------------------------------------------
 
-    def _learn(self, group_id: str, reading_id: int, timestamp: str) -> None:
+    def _learn(self, group_id: str, numeric_value: Optional[float],
+               reading_id: int, timestamp: str) -> None:
         if self._conn is None or self._learner is None:
             return
         with self._model_lock:
             result = self._learner.observe(
-                group_id, now=timestamp, basis_reading_id=reading_id,
+                group_id,
+                numeric_value,
+                now=timestamp,
+                basis_reading_id=reading_id,
             )
-            resolved, new_prediction_id = learn_repo.apply_learning(
+            resolved, new_prediction_id = learn_repo.apply_manual_learning(
                 self._conn, self._model_version, REGION_A_ID, result,
                 self._pending_prediction_id,
             )
             self._pending_prediction_id = new_prediction_id
 
-        if resolved and result.resolved is not None:
-            p = result.resolved
+        if resolved and result.range_result.resolved is not None:
+            p = result.range_result.resolved
             self.prediction_resolved.emit({
                 "candidate_group": p.candidate_group,
                 "actual_group": p.actual_group,
@@ -798,6 +818,10 @@ class MonitoringEngine(QObject):
             "recent_accuracy": p.recent_accuracy,
             "pattern_length": p.pattern_length,
             "pattern_sequence": p.pattern_sequence,
+            "pattern_kind": p.pattern_kind,
+            "definition_id": p.definition_id,
+            "next_movement": p.next_movement,
+            "next_movement_confidence": p.next_movement_confidence,
         }
         self.prediction_made.emit(prediction)
 
@@ -855,6 +879,103 @@ class MonitoringEngine(QObject):
             summary["latest_timestamp"] = row["capture_timestamp"]
         return summary
 
+    # ------------------------------------------------------------------
+    # Manual patterns (user-defined only)
+    # ------------------------------------------------------------------
+
+    def region_b_save_mode(self) -> str:
+        return self._region_b_save_mode()
+
+    def set_region_b_save_mode(self, mode: str) -> bool:
+        """Persist Region B's own save mode (``every`` or ``on_change``)."""
+        if self._conn is None:
+            return False
+        if mode not in (pipeline.MODE_EVERY, pipeline.MODE_ON_CHANGE):
+            return False
+        set_setting(self._conn, "region_b_save_mode", mode)
+        self._conn.commit()
+        return True
+
+    def list_patterns(self) -> List[Dict[str, Any]]:
+        if self._conn is None:
+            return []
+        out: List[Dict[str, Any]] = []
+        for definition in learn_repo.list_pattern_definitions(self._conn):
+            out.append({
+                "pattern_id": definition.pattern_id,
+                "kind": definition.kind,
+                "tokens": list(definition.tokens),
+                "sequence": definition.sequence_text,
+                "label": definition.label,
+                "enabled": definition.enabled,
+                "length": definition.length,
+            })
+        return out
+
+    def add_pattern(self, kind: str, tokens: List[str],
+                    label: str = "") -> int:
+        """Add a manual pattern.  Raises ``ValueError`` on invalid input."""
+        if self._conn is None:
+            raise ValueError("database not initialised")
+        with self._model_lock:
+            pattern_id = learn_repo.create_pattern_definition(
+                self._conn, kind, tokens, label)
+        self._after_pattern_change()
+        return pattern_id
+
+    def delete_pattern(self, pattern_id: int) -> bool:
+        if self._conn is None:
+            return False
+        with self._model_lock:
+            deleted = learn_repo.delete_pattern_definition(
+                self._conn, pattern_id)
+        if deleted:
+            self._after_pattern_change()
+        return deleted
+
+    def set_pattern_enabled(self, pattern_id: int, enabled: bool) -> bool:
+        if self._conn is None:
+            return False
+        with self._model_lock:
+            changed = learn_repo.set_pattern_enabled(
+                self._conn, pattern_id, enabled)
+        if changed:
+            self._after_pattern_change()
+        return changed
+
+    def update_pattern_label(self, pattern_id: int, label: str) -> bool:
+        if self._conn is None:
+            return False
+        with self._model_lock:
+            changed = learn_repo.update_pattern_label(
+                self._conn, pattern_id, label)
+        if changed:
+            self._reload_model()
+        return changed
+
+    def pattern_summaries(self) -> List[Dict[str, Any]]:
+        if self._conn is None:
+            return []
+        return learn_repo.manual_pattern_summaries(
+            self._conn, self._model_version)
+
+    def pattern_outcomes(self, pattern_id: int) -> Dict[str, List[Dict]]:
+        if self._conn is None:
+            return {"next_ranges": [], "next_movements": []}
+        return learn_repo.pattern_outcomes(
+            self._conn, self._model_version, pattern_id)
+
+    def _after_pattern_change(self) -> None:
+        """Mark the model stale and let listeners schedule a rebuild."""
+        if self._conn is None:
+            return
+        mark_model_stale(
+            self._conn,
+            "pattern definitions changed; recalculate the app brain")
+        self._reload_model()
+        self.patterns_changed.emit()
+        self.counters_updated.emit(self.counters())
+
     def total_detections(self) -> int:
         """Backward-compatible alias for the Region A reading count."""
         return self.total_readings()
@@ -892,6 +1013,7 @@ class MonitoringEngine(QObject):
         return {
             "model_version": self._model_version,
             "patterns": patterns,
+            "definitions": learn_repo.manual_pattern_count(conn),
             "observed": observed,
             "predictions": summary,
             "readings": learn_repo.region_a_reading_count(conn, group_ids),
@@ -904,14 +1026,18 @@ class MonitoringEngine(QObject):
         if self._conn is None:
             return None
         row = self._conn.execute(
-            "SELECT * FROM predictions ORDER BY prediction_id DESC LIMIT 1"
+            """SELECT * FROM predictions
+               WHERE model_version = ? AND definition_id IS NOT NULL
+               ORDER BY prediction_id DESC LIMIT 1""",
+            (self._model_version,),
         ).fetchone()
         return dict(row) if row is not None else None
 
     def recent_predictions(self, limit: int = 100) -> List[Dict[str, Any]]:
         if self._conn is None:
             return []
-        return [dict(r) for r in learn_repo.recent_predictions(self._conn, limit)]
+        return [dict(r) for r in learn_repo.recent_predictions(
+            self._conn, limit, model_version=self._model_version)]
 
     def top_patterns(self, limit: int = 100) -> List[Dict[str, Any]]:
         if self._conn is None:

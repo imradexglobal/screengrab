@@ -31,10 +31,10 @@ from src.config.repository import (
 )
 from src.database.init_db import REGION_A_ID, count_valid_region_a_readings
 from src.learning import repository as learn_repo
+from src.learning.manual_brain import ManualBrain
 from src.learning.patterns import (
     DEFAULT_PATTERN_LENGTHS,
     DEFAULT_RECENT_WINDOW,
-    LearningEngine,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,11 @@ def recalculate_app_brain(
 ) -> Dict:
     """Rebuild all derived learning data atomically.
 
+    Only the user's own ``pattern_definitions`` are learned.  When no pattern
+    is defined the rebuild still publishes an empty VALID model: there is
+    simply nothing to predict yet, and adding a pattern triggers another
+    rebuild.
+
     Returns a result dict: ``{"ok": bool, "model_version": int|None,
     "source_count": int, "predictions": int, "patterns": int, "error": str}``.
     """
@@ -70,7 +75,7 @@ def recalculate_app_brain(
 
     range_version = _current_range_version(conn)
     config = load_range_config(conn)
-    abbreviation = config.abbreviation
+    definitions = learn_repo.enabled_pattern_definitions(conn)
 
     version = _begin_model_version(conn, range_version, algorithm_version)
     source_count = 0
@@ -91,6 +96,7 @@ def recalculate_app_brain(
         # 3) Reclassify every reading with the current ranges (derived field).
         classified: List[tuple] = []
         groups: List[str] = []
+        values: List[float] = []
         timestamps: List[str] = []
         reading_ids: List[int] = []
         for row in snapshot:
@@ -98,6 +104,7 @@ def recalculate_app_brain(
             classified.append((gid, range_version, row["reading_id"]))
             if gid is not None:
                 groups.append(gid)
+                values.append(float(row["numeric_value"]))
                 timestamps.append(row["capture_timestamp"])
                 reading_ids.append(row["reading_id"])
 
@@ -105,16 +112,16 @@ def recalculate_app_brain(
 
         # 4) Chronological replay - a prediction is always created before the
         #    next actual outcome is observed.
-        engine = LearningEngine(
-            abbreviation_fn=abbreviation,
-            pattern_lengths=pattern_lengths,
+        brain = ManualBrain(
+            definitions,
             recent_window=recent_window,
         )
         predictions = []
         total = max(len(groups), 1)
         for idx, gid in enumerate(groups):
-            result = engine.observe(
+            result = brain.observe(
                 gid,
+                values[idx],
                 now=timestamps[idx],
                 basis_reading_id=reading_ids[idx],
                 expected_reading_id=(reading_ids[idx + 1]
@@ -127,7 +134,7 @@ def recalculate_app_brain(
 
         report(0.85, f"Replayed {len(groups)} classified readings")
 
-        stat_rows = [s.to_row() for s in engine.stats.values()]
+        stat_rows = brain.all_stat_rows()
 
         # 5) Validate before publishing anything.
         if source_count > 0 and len(groups) == 0:
@@ -149,8 +156,8 @@ def recalculate_app_brain(
                 """INSERT INTO pattern_stats
                    (model_version, pattern_length, pattern_sequence, candidate_group,
                     opportunities, resolved, correct, incorrect, recent_outcomes,
-                    first_seen, last_seen)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    first_seen, last_seen, pattern_kind, definition_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         version, r["pattern_length"], r["pattern_sequence"],
@@ -158,6 +165,7 @@ def recalculate_app_brain(
                         r["correct"], r["incorrect"],
                         json.dumps(r.get("recent_outcomes", [])),
                         r.get("first_seen"), r.get("last_seen"),
+                        r.get("pattern_kind", "range"), r.get("definition_id"),
                     )
                     for r in stat_rows
                 ],
@@ -167,8 +175,10 @@ def recalculate_app_brain(
                    (model_version, created_at, region_id, pattern_length,
                     pattern_sequence, candidate_group, confidence, resolved_count,
                     correct_count, recent_accuracy, eligible, basis_reading_id,
-                    expected_reading_id, actual_group, resolved_at, is_correct)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
+                    expected_reading_id, actual_group, resolved_at, is_correct,
+                    pattern_kind, definition_id, next_movement,
+                    next_movement_confidence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         version, p.created_at or _now(), REGION_A_ID,
@@ -177,6 +187,8 @@ def recalculate_app_brain(
                         p.recent_accuracy, p.basis_reading_id,
                         p.expected_reading_id, p.actual_group, p.resolved_at,
                         None if p.is_correct is None else (1 if p.is_correct else 0),
+                        p.pattern_kind, p.definition_id, p.next_movement,
+                        p.next_movement_confidence,
                     )
                     for p in predictions
                 ],

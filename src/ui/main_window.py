@@ -68,6 +68,11 @@ from src.database.init_db import (
     get_connection,
     initialise_database,
 )
+from src.learning.manual_brain import (
+    MAX_PATTERN_LENGTH,
+    MIN_PATTERN_LENGTH,
+    normalise_movement,
+)
 from src.monitor.engine import MonitoringEngine, create_engine
 from src.monitor.region_manager import Region, RegionManager, create_region_manager
 from src.normalisation import parse_and_normalise
@@ -1453,8 +1458,9 @@ class RegionsWidget(QWidget):
             layout, "Regions",
             "Two region slots are available. Region A is the learning reader "
             "that feeds the automation gate. Region B is a store-only reader: "
-            "it records its values into their own history table and never "
-            "affects the model, the gate or clicking.")
+            "it records any confidently parsed number, including 0.00, into "
+            "its own history table — ignoring the configured ranges — and "
+            "never affects the model, the gate or clicking.")
 
         # --- Region A --------------------------------------------------
         self.region_a_group = QGroupBox(REGION_A_LABEL)
@@ -1520,6 +1526,16 @@ class RegionsWidget(QWidget):
                        "table (separate from Region A).")
         add_help_label(b_layout, "Latest value", self.region_b_latest,
                        "The most recent number Region B read.")
+        self.region_b_save_mode_combo = QComboBox()
+        self.region_b_save_mode_combo.addItem("Every scan", "every")
+        self.region_b_save_mode_combo.addItem("On change only", "on_change")
+        self.region_b_save_mode_combo.currentIndexChanged.connect(
+            self._on_region_b_save_mode_changed)
+        add_help_label(b_layout, "Save mode", self.region_b_save_mode_combo,
+                       "Region B stores any confidently parsed number, including "
+                       "0.00, and ignores the configured ranges. Every scan "
+                       "keeps every reading; On change only skips an immediate "
+                       "repeat of the same value.")
 
         b_buttons = QGridLayout()
         b_buttons.setHorizontalSpacing(8)
@@ -1592,6 +1608,27 @@ class RegionsWidget(QWidget):
                 self.region_b_latest.setText(str(latest))
         else:
             self.region_b_latest.setText("—")
+
+        try:
+            mode = self.engine.region_b_save_mode()
+            index = self.region_b_save_mode_combo.findData(mode)
+            if index >= 0 and index != self.region_b_save_mode_combo.currentIndex():
+                self.region_b_save_mode_combo.blockSignals(True)
+                self.region_b_save_mode_combo.setCurrentIndex(index)
+                self.region_b_save_mode_combo.blockSignals(False)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @Slot(int)
+    def _on_region_b_save_mode_changed(self, _index: int) -> None:
+        """Persist Region B's save mode; it never affects Region A."""
+        if not self.engine:
+            return
+        mode = self.region_b_save_mode_combo.currentData()
+        if not self.engine.set_region_b_save_mode(str(mode)):
+            QMessageBox.warning(
+                self, "Region B Save Mode",
+                "The save mode could not be saved.")
 
     @Slot(dict)
     def _on_prediction_made_hud(self, prediction: dict) -> None:
@@ -2456,19 +2493,38 @@ class SettingsWidget(QWidget):
 
 
 class LearningWidget(QWidget):
-    """Pattern-learning view with the mandatory "Recalculate App Brain" action."""
+    """User-defined patterns, their outcomes and model recalculation.
+
+    The application never discovers patterns by itself.  Every row in
+    "My Patterns" was added by the user, and only enabled definitions are
+    learned.  Editing a definition marks the model stale and schedules a
+    debounced rebuild so the outcome tables stay in step with the definitions.
+    """
 
     recalc_progress = Signal(float, str)
     recalc_finished = Signal(dict)
 
+    #: Wait this long after a pattern edit before rebuilding automatically.
+    REBUILD_DEBOUNCE_MS = 1500
+
     def __init__(self, engine: MonitoringEngine, parent=None):
         super().__init__(parent)
         self.engine = engine
+        self._loading_patterns = False
+        self._recalculating = False
+        self._rebuild_timer = QTimer(self)
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.setInterval(self.REBUILD_DEBOUNCE_MS)
+        self._rebuild_timer.timeout.connect(self._auto_rebuild)
         self._setup_ui()
         self.recalc_progress.connect(self._on_recalc_progress)
         self.recalc_finished.connect(self._on_recalc_finished)
+        if self.engine is not None:
+            self.engine.patterns_changed.connect(self._on_patterns_changed)
         self.refresh()
 
+    # ------------------------------------------------------------------
+    # UI construction
     # ------------------------------------------------------------------
     def _setup_ui(self):
         layout = _scrolled_page(self)
@@ -2476,35 +2532,39 @@ class LearningWidget(QWidget):
         layout.setContentsMargins(20, 20, 20, 20)
         page_header(
             layout, "Learning",
-            "What the model learned from stored readings, how accurate its "
-            "predictions are, and the one action that rebuilds it.")
+            "Patterns are added by you — the app never discovers or generates "
+            "them automatically. Each pattern reports what tends to follow it "
+            "as the next number range and as the next up/down movement.")
 
-        # --- twin model summaries side by side ---------------------------
-        summary_row = QHBoxLayout()
-        summary_row.setSpacing(16)
-
-        summary_group = QGroupBox("Model Summary — All categories")
+        # --- model summary ------------------------------------------------
+        summary_group = QGroupBox("Model Summary")
         summary_layout = QFormLayout(summary_group)
         summary_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.model_version_label = QLabel("-")
         self.model_state_label = QLabel("STALE")
+        self.definitions_label = QLabel("0")
         self.pattern_count_label = QLabel("0")
         self.observed_count_label = QLabel("0")
         self.predictions_label = QLabel("0 total / 0 resolved")
         self.accuracy_label = QLabel("-")
         self.unresolved_label = QLabel("0")
         self.recent_label = QLabel("-")
-        self.evidence_label = QLabel("-")
         add_help_row(summary_layout, "Model version", self.model_version_label,
-                     "The recalculation version currently in use. Every pattern "
-                     "and prediction shown belongs to this version.")
+                     "The recalculation version currently in use. Every outcome "
+                     "shown belongs to this version.")
         add_help_row(summary_layout, "Model state", self.model_state_label,
                      "VALID means the model matches the stored readings. STALE "
-                     "means readings changed since the last recalculation.")
-        add_help_row(summary_layout, "Pattern rows", self.pattern_count_label,
-                     "Learned pattern rows in the model (sequence lengths 4-8).")
+                     "means the definitions or readings changed and the brain "
+                     "must be recalculated.")
+        add_help_row(summary_layout, "Defined patterns", self.definitions_label,
+                     "Patterns you added on this page. Disabled patterns are "
+                     "kept but not learned.")
+        add_help_row(summary_layout, "Outcome rows", self.pattern_count_label,
+                     "Derived outcome rows in the current model. One pattern "
+                     "normally produces several rows (one per next outcome).")
         add_help_row(summary_layout, "Observations", self.observed_count_label,
-                     "How many sequences the learner has seen so far.")
+                     "Region A readings fed to the manual brain since the last "
+                     "reload or recalculation.")
         add_help_row(summary_layout, "Predictions", self.predictions_label,
                      "Total predictions made and how many have been resolved "
                      "against a later real outcome.")
@@ -2515,53 +2575,115 @@ class LearningWidget(QWidget):
         add_help_row(summary_layout, "Recent performance", self.recent_label,
                      "Accuracy over the most recent resolved predictions, "
                      "compared with the safeguard threshold.")
-        add_help_row(summary_layout, "Evidence sufficiency", self.evidence_label,
-                     "Resolved predictions versus the minimum needed before "
-                     "automated clicking may resume.")
-        summary_row.addWidget(summary_group, 1)
+        layout.addWidget(summary_group)
 
-        filtered_group = QGroupBox(
-            "Model Summary — Clickable categories (Settings)")
-        filtered_layout = QFormLayout(filtered_group)
-        filtered_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.f_model_version_label = QLabel("-")
-        self.f_categories_label = QLabel("-")
-        self.f_readings_label = QLabel("0")
-        self.f_patterns_label = QLabel("0")
-        self.f_predictions_label = QLabel("0 total / 0 resolved")
-        self.f_accuracy_label = QLabel("-")
-        self.f_unresolved_label = QLabel("0")
-        self.f_recent_label = QLabel("-")
-        add_help_row(filtered_layout, "Model version", self.f_model_version_label,
-                     "Same model version as the left panel; only the category "
-                     "filter differs.")
-        add_help_row(filtered_layout, "Categories", self.f_categories_label,
-                     "The categories ticked in Settings as clickable. Every "
-                     "number on this panel counts only those categories.")
-        add_help_row(filtered_layout, "Readings", self.f_readings_label,
-                     "Stored Region A readings that fall inside the clickable "
-                     "categories.")
-        add_help_row(filtered_layout, "Pattern rows", self.f_patterns_label,
-                     "Learned patterns whose next group is a clickable category.")
-        add_help_row(filtered_layout, "Predictions", self.f_predictions_label,
-                     "Predictions for clickable categories, total and resolved.")
-        add_help_row(filtered_layout, "Resolved accuracy", self.f_accuracy_label,
-                     "Accuracy restricted to clickable categories.")
-        add_help_row(filtered_layout, "Unresolved", self.f_unresolved_label,
-                     "Clickable-category predictions still awaiting an outcome.")
-        add_help_row(filtered_layout, "Recent performance", self.f_recent_label,
-                     "Recent accuracy restricted to clickable categories.")
-        summary_row.addWidget(filtered_group, 1)
-        layout.addLayout(summary_row)
+        # --- pattern builder ----------------------------------------------
+        builder_group = QGroupBox("Add a Pattern")
+        builder_layout = QFormLayout(builder_group)
+        builder_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItem("Number range", "range")
+        self.kind_combo.addItem("Movement", "movement")
+        self.kind_combo.currentIndexChanged.connect(self._update_builder_hint)
+        self.tokens_edit = QLineEdit()
+        self.tokens_edit.returnPressed.connect(self._on_add_pattern)
+        self.label_edit = QLineEdit()
+        self.label_edit.setPlaceholderText("Optional name, e.g. morning cycle")
+        self.builder_hint = help_text("")
+        add_help_row(builder_layout, "Pattern type", self.kind_combo,
+                     "A number-range pattern uses the configured ranges. A "
+                     "movement pattern uses UP, DOWN and FLAT.")
+        add_help_row(builder_layout, "Tokens", self.tokens_edit,
+                     "Enter 2-12 tokens separated by commas.")
+        add_help_row(builder_layout, "Label", self.label_edit,
+                     "An optional friendly name shown in the table.")
+        builder_layout.addRow("", self.builder_hint)
 
-        # --- recalculation ------------------------------------------------
+        builder_buttons = QHBoxLayout()
+        self.add_pattern_btn = make_button(
+            "Add Pattern", "primary",
+            "Add this pattern to the manual brain.")
+        self.add_pattern_btn.clicked.connect(self._on_add_pattern)
+        builder_buttons.addWidget(self.add_pattern_btn)
+        builder_buttons.addStretch(1)
+        builder_layout.addRow("", builder_buttons)
+        layout.addWidget(builder_group)
+
+        # --- my patterns ---------------------------------------------------
+        patterns_group = QGroupBox("My Patterns")
+        patterns_layout = QVBoxLayout(patterns_group)
+        patterns_layout.addWidget(help_text(
+            "Tick a pattern to learn it, untick to pause it. Only enabled "
+            "patterns are used for predictions. Click a header to sort."))
+        self.patterns_table = PlaceholderTable(
+            0, 9,
+            "No patterns defined yet — add one above to start learning.")
+        self.patterns_table.setHorizontalHeaderLabels(
+            ["On", "ID", "Type", "Pattern", "Length", "Matches",
+             "Next range", "Next movement", "Accuracy %"])
+        configure_fit_table(self.patterns_table, min_height=260)
+        self.patterns_table.setSortingEnabled(True)
+        self.patterns_table.itemSelectionChanged.connect(self._on_pattern_selected)
+        self.patterns_table.itemChanged.connect(self._on_pattern_item_changed)
+        patterns_layout.addWidget(self.patterns_table)
+
+        pattern_buttons = QHBoxLayout()
+        self.toggle_pattern_btn = make_button(
+            "Enable / Disable", "quiet",
+            "Toggle whether the selected pattern is learned.")
+        self.rename_pattern_btn = make_button(
+            "Rename", "quiet", "Change the selected pattern's label.")
+        self.delete_pattern_btn = make_button(
+            "Delete Pattern", "danger",
+            "Delete the selected pattern and its derived outcomes.")
+        for button in (self.toggle_pattern_btn, self.rename_pattern_btn,
+                       self.delete_pattern_btn):
+            button.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.toggle_pattern_btn.clicked.connect(self._on_toggle_pattern)
+        self.rename_pattern_btn.clicked.connect(self._on_rename_pattern)
+        self.delete_pattern_btn.clicked.connect(self._on_delete_pattern)
+        pattern_buttons.addWidget(self.toggle_pattern_btn)
+        pattern_buttons.addWidget(self.rename_pattern_btn)
+        pattern_buttons.addWidget(self.delete_pattern_btn)
+        pattern_buttons.addStretch(1)
+        patterns_layout.addLayout(pattern_buttons)
+        layout.addWidget(patterns_group, 1)
+
+        # --- outcomes for the selected pattern -----------------------------
+        outcomes_group = QGroupBox("Outcomes for the Selected Pattern")
+        outcomes_layout = QVBoxLayout(outcomes_group)
+        self.outcomes_caption = QLabel(
+            "Select a pattern above to see what tends to follow it.")
+        self.outcomes_caption.setWordWrap(True)
+        self.outcomes_caption.setStyleSheet("color: #555555;")
+        outcomes_layout.addWidget(self.outcomes_caption)
+
+        outcomes_layout.addWidget(QLabel("Next number range"))
+        self.range_outcomes_table = PlaceholderTable(
+            0, 5, "No next-range outcomes recorded for this pattern yet.")
+        self.range_outcomes_table.setHorizontalHeaderLabels(
+            ["Next range", "Opportunities", "Resolved", "Correct", "Accuracy %"])
+        configure_fit_table(self.range_outcomes_table, min_height=170)
+        outcomes_layout.addWidget(self.range_outcomes_table)
+
+        outcomes_layout.addWidget(QLabel("Next movement"))
+        self.movement_outcomes_table = PlaceholderTable(
+            0, 5, "No next-movement outcomes recorded for this pattern yet.")
+        self.movement_outcomes_table.setHorizontalHeaderLabels(
+            ["Next movement", "Opportunities", "Resolved", "Correct",
+             "Accuracy %"])
+        configure_fit_table(self.movement_outcomes_table, min_height=170)
+        outcomes_layout.addWidget(self.movement_outcomes_table)
+        layout.addWidget(outcomes_group, 1)
+
+        # --- recalculation -------------------------------------------------
         recalc_group = QGroupBox("Model Recalculation")
         recalc_layout = QVBoxLayout(recalc_group)
         note = QLabel(
-            "Recalculation rebuilds every derived pattern and prediction from the "
-            "stored Region A readings. Automated clicking is suspended while it runs. "
-            "Raw readings are never deleted or modified."
-        )
+            "Recalculation replays the stored Region A readings through your "
+            "enabled patterns and rebuilds every outcome row and prediction. "
+            "Automated clicking is suspended while it runs. Raw readings are "
+            "never deleted or modified.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #555555;")
         recalc_layout.addWidget(note)
@@ -2569,7 +2691,7 @@ class LearningWidget(QWidget):
         recalc_row = QHBoxLayout()
         self.recalc_btn = make_button(
             "Recalculate App Brain", "primary",
-            "Rebuild every pattern and prediction from stored readings.")
+            "Rebuild every outcome and prediction from stored readings.")
         self.recalc_btn.clicked.connect(self._on_recalculate)
         recalc_row.addWidget(self.recalc_btn)
         self.recalc_status_label = QLabel("Idle")
@@ -2582,48 +2704,413 @@ class LearningWidget(QWidget):
         recalc_layout.addWidget(self.recalc_progress_bar)
         layout.addWidget(recalc_group)
 
-        # --- patterns -----------------------------------------------------
-        patterns_group = QGroupBox("Learned Patterns (lengths 4-8)")
-        patterns_layout = QVBoxLayout(patterns_group)
-        patterns_hint = help_text(
-            "Click any column header to sort A-Z; click again for Z-A. "
-            "Numeric columns sort by value, not by text.")
-        patterns_layout.addWidget(patterns_hint)
-        self.patterns_table = PlaceholderTable(
-            0, 8,
-            "No learned patterns yet - the model learns once enough Region A "
-            "readings have been stored and the brain has been recalculated.")
-        self.patterns_table.setHorizontalHeaderLabels(
-            ["Length", "Pattern", "Next Group", "Opportunities",
-             "Resolved", "Correct", "Incorrect", "Accuracy %"])
-        configure_fit_table(self.patterns_table, min_height=280)
-        self.patterns_table.setSortingEnabled(True)
-        patterns_layout.addWidget(self.patterns_table)
-        layout.addWidget(patterns_group, 1)
-
-        # --- predictions --------------------------------------------------
-        predictions_group = QGroupBox("Recent Predictions")
-        predictions_layout = QVBoxLayout(predictions_group)
-        predictions_hint = help_text(
-            "Click any column header to sort A-Z; click again for Z-A.")
-        predictions_layout.addWidget(predictions_hint)
-        self.predictions_table = PlaceholderTable(
-            0, 7,
-            "No predictions yet - predictions appear after the model has seen "
-            "enough sequences to forecast the next category.")
-        self.predictions_table.setHorizontalHeaderLabels(
-            ["ID", "Length", "Predicted", "Confidence %",
-             "Resolved Count", "Recent Acc %", "Outcome"])
-        configure_fit_table(self.predictions_table, min_height=260)
-        self.predictions_table.setSortingEnabled(True)
-        predictions_layout.addWidget(self.predictions_table)
-        layout.addWidget(predictions_group, 1)
-
-        self.refresh_btn = make_button("Refresh", "accent",
-                                       "Re-read the model from the database now.")
+        self.refresh_btn = make_button(
+            "Refresh", "accent",
+            "Re-read the patterns and outcomes from the database now.")
         self.refresh_btn.clicked.connect(self.refresh)
         layout.addWidget(self.refresh_btn)
 
+        self._update_builder_hint()
+
+    # ------------------------------------------------------------------
+    # Builder helpers
+    # ------------------------------------------------------------------
+    def _range_options_text(self) -> str:
+        if not self.engine or self.engine._conn is None:
+            return ""
+        try:
+            groups = config_repo.load_groups(self.engine._conn)
+        except Exception:  # noqa: BLE001
+            return ""
+        return ", ".join(f"{float(g.lower_bound):.2f}" for g in groups)
+
+    def _update_builder_hint(self):
+        kind = self.kind_combo.currentData()
+        if kind == "movement":
+            self.tokens_edit.setPlaceholderText("e.g. UP, DOWN, UP, DOWN")
+            self.builder_hint.setText(
+                "Use UP (higher than the previous number), DOWN (lower) or "
+                "FLAT (the same at two decimal places), separated by commas. "
+                "Length 2-12.")
+        else:
+            self.tokens_edit.setPlaceholderText("e.g. 1.00, 1.26, 1.00")
+            options = self._range_options_text()
+            suffix = f" Available ranges: {options}." if options else ""
+            self.builder_hint.setText(
+                "Use the lower bound of each configured range, separated by "
+                "commas (the group id, e.g. g1, is accepted too)." + suffix)
+
+    def _parse_tokens(self, kind: str) -> List[str]:
+        text = self.tokens_edit.text().strip()
+        if not text:
+            raise ValueError("Enter at least two tokens separated by commas.")
+        raw = [t for t in text.replace(",", " ").replace(";", " ").split() if t]
+
+        if kind == "movement":
+            tokens = [normalise_movement(t) for t in raw]
+        else:
+            conn = self.engine._conn if self.engine else None
+            groups = config_repo.load_groups(conn) if conn is not None else []
+            by_id = {g.group_id for g in groups}
+            by_bound = {f"{float(g.lower_bound):.2f}": g.group_id
+                        for g in groups}
+            tokens = []
+            for token in raw:
+                if token in by_id:
+                    tokens.append(token)
+                    continue
+                try:
+                    value = float(token)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"'{token}' is not a configured range. Use one of: "
+                        f"{self._range_options_text() or 'the group ids'}.")
+                key = f"{value:.2f}"
+                if key not in by_bound:
+                    raise ValueError(
+                        f"{key} is not the lower bound of any configured "
+                        f"range. Available ranges: "
+                        f"{self._range_options_text() or 'none'}.")
+                tokens.append(by_bound[key])
+
+        if not (MIN_PATTERN_LENGTH <= len(tokens) <= MAX_PATTERN_LENGTH):
+            raise ValueError(
+                f"A pattern needs between {MIN_PATTERN_LENGTH} and "
+                f"{MAX_PATTERN_LENGTH} tokens.")
+        return tokens
+
+    def _on_add_pattern(self):
+        if not self.engine or self.engine._conn is None:
+            QMessageBox.warning(self, "Add Pattern",
+                                "The database is not available.")
+            return
+        kind = self.kind_combo.currentData()
+        try:
+            tokens = self._parse_tokens(kind)
+            self.engine.add_pattern(kind, tokens, self.label_edit.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Add Pattern", str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not add pattern: %s", exc)
+            QMessageBox.warning(self, "Add Pattern",
+                                f"The pattern could not be saved:\n{exc}")
+            return
+        self.tokens_edit.clear()
+        self.label_edit.clear()
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    # Pattern table
+    # ------------------------------------------------------------------
+    def _selected_pattern_id(self) -> Optional[int]:
+        row = self.patterns_table.currentRow()
+        if row < 0:
+            return None
+        item = self.patterns_table.item(row, 0)
+        if item is None:
+            return None
+        value = item.data(Qt.UserRole)
+        return int(value) if value is not None else None
+
+    def _on_pattern_selected(self):
+        self._fill_outcomes()
+
+    def _on_pattern_item_changed(self, item):
+        if self._loading_patterns or item is None or item.column() != 0:
+            return
+        value = item.data(Qt.UserRole)
+        if value is None or not self.engine:
+            return
+        enabled = item.checkState() == Qt.Checked
+        try:
+            self.engine.set_pattern_enabled(int(value), enabled)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not toggle pattern %s: %s", value, exc)
+
+    def _fill_patterns(self):
+        if not self.engine or self.engine._conn is None:
+            return
+        summaries = self.engine.pattern_summaries()
+        group_labels = _group_bound_labels(self.engine._conn)
+        selected = self._selected_pattern_id()
+
+        self._loading_patterns = True
+        self.patterns_table.setSortingEnabled(False)
+        try:
+            self.patterns_table.setRowCount(len(summaries))
+            for i, summary in enumerate(summaries):
+                pattern_id = int(summary["pattern_id"])
+                enabled_item = QTableWidgetItem("")
+                enabled_item.setFlags(
+                    Qt.ItemIsUserCheckable | Qt.ItemIsEnabled |
+                    Qt.ItemIsSelectable)
+                enabled_item.setCheckState(
+                    Qt.Checked if summary.get("enabled") else Qt.Unchecked)
+                enabled_item.setData(Qt.UserRole, pattern_id)
+                self.patterns_table.setItem(i, 0, enabled_item)
+
+                self.patterns_table.setItem(
+                    i, 1, make_item(str(pattern_id), pattern_id))
+                kind = "Range" if summary.get("kind") == "range" else "Movement"
+                self.patterns_table.setItem(i, 2, make_item(kind))
+
+                tokens = [str(t) for t in summary.get("tokens", [])]
+                if summary.get("kind") == "range":
+                    pattern_text = " → ".join(
+                        group_labels.get(t, t) for t in tokens)
+                else:
+                    pattern_text = " → ".join(tokens)
+                self.patterns_table.setItem(i, 3, make_item(pattern_text))
+
+                length = int(summary.get("length") or len(tokens))
+                matches = int(summary.get("matches") or 0)
+                self.patterns_table.setItem(i, 4, make_item(str(length), length))
+                self.patterns_table.setItem(i, 5, make_item(str(matches), matches))
+
+                next_range = summary.get("best_next_range")
+                self.patterns_table.setItem(
+                    i, 6, make_item(
+                        group_labels.get(str(next_range), str(next_range))
+                        if next_range else "—"))
+                next_movement = summary.get("best_next_movement")
+                self.patterns_table.setItem(
+                    i, 7, make_item(str(next_movement) if next_movement else "—"))
+
+                accuracy = summary.get("accuracy")
+                self.patterns_table.setItem(
+                    i, 8,
+                    make_item(f"{float(accuracy):.1f}" if accuracy is not None
+                              else "-",
+                              float(accuracy) if accuracy is not None else None))
+        finally:
+            self.patterns_table.setSortingEnabled(True)
+            self._loading_patterns = False
+
+        fit_columns(self.patterns_table)
+
+        target = selected
+        if target is None and summaries:
+            target = int(summaries[0]["pattern_id"])
+        if target is not None:
+            for row in range(self.patterns_table.rowCount()):
+                item = self.patterns_table.item(row, 0)
+                if item is not None and item.data(Qt.UserRole) == target:
+                    self.patterns_table.selectRow(row)
+                    break
+        self._fill_outcomes()
+
+    # ------------------------------------------------------------------
+    # Outcomes
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clear_outcome_table(table: QTableWidget):
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+
+    def _fill_outcomes(self):
+        if not self.engine or self.engine._conn is None:
+            return
+        pattern_id = self._selected_pattern_id()
+        if pattern_id is None:
+            self.outcomes_caption.setText(
+                "Select a pattern above to see what tends to follow it.")
+            self._clear_outcome_table(self.range_outcomes_table)
+            self._clear_outcome_table(self.movement_outcomes_table)
+            return
+
+        summary = None
+        for item in self.engine.pattern_summaries():
+            if int(item["pattern_id"]) == pattern_id:
+                summary = item
+                break
+        if summary is None:
+            self.outcomes_caption.setText(
+                "The selected pattern no longer exists.")
+            self._clear_outcome_table(self.range_outcomes_table)
+            self._clear_outcome_table(self.movement_outcomes_table)
+            return
+
+        label = summary.get("label") or "Pattern"
+        self.outcomes_caption.setText(
+            f"{label} — {summary.get('sequence', '')} "
+            f"({summary.get('kind', 'range')}, "
+            f"{summary.get('matches', 0)} matches)")
+
+        outcomes = self.engine.pattern_outcomes(pattern_id)
+        group_labels = _group_bound_labels(self.engine._conn)
+        self._fill_outcome_table(
+            self.range_outcomes_table, outcomes.get("next_ranges", []),
+            lambda candidate: group_labels.get(candidate, candidate))
+        self._fill_outcome_table(
+            self.movement_outcomes_table, outcomes.get("next_movements", []),
+            lambda candidate: candidate)
+
+    def _fill_outcome_table(self, table: QTableWidget, rows: List[Dict],
+                            label_fn):
+        def fill():
+            table.setRowCount(len(rows))
+            for i, row in enumerate(rows):
+                opportunities = int(row.get("opportunities") or 0)
+                resolved = int(row.get("resolved") or 0)
+                correct = int(row.get("correct") or 0)
+                accuracy = row.get("accuracy")
+                table.setItem(i, 0, make_item(label_fn(str(row.get("candidate")))))
+                table.setItem(i, 1, make_item(str(opportunities), opportunities))
+                table.setItem(i, 2, make_item(str(resolved), resolved))
+                table.setItem(i, 3, make_item(str(correct), correct))
+                table.setItem(
+                    i, 4,
+                    make_item(f"{float(accuracy):.1f}" if accuracy is not None
+                              else "-",
+                              float(accuracy) if accuracy is not None else None))
+        sort_safely(table, fill)
+        fit_columns(table)
+
+    # ------------------------------------------------------------------
+    # Pattern actions
+    # ------------------------------------------------------------------
+    def _on_toggle_pattern(self):
+        pattern_id = self._selected_pattern_id()
+        if pattern_id is None or not self.engine:
+            QMessageBox.information(self, "Enable / Disable",
+                                    "Select a pattern first.")
+            return
+        row = self.patterns_table.currentRow()
+        item = self.patterns_table.item(row, 0)
+        enabled = bool(item and item.checkState() == Qt.Checked)
+        self.engine.set_pattern_enabled(pattern_id, not enabled)
+
+    def _on_rename_pattern(self):
+        pattern_id = self._selected_pattern_id()
+        if pattern_id is None or not self.engine:
+            QMessageBox.information(self, "Rename Pattern",
+                                    "Select a pattern first.")
+            return
+        current = ""
+        for summary in self.engine.pattern_summaries():
+            if int(summary["pattern_id"]) == pattern_id:
+                current = summary.get("label") or ""
+                break
+        label, accepted = QInputDialog.getText(
+            self, "Rename Pattern", "Label:", text=current)
+        if accepted:
+            self.engine.update_pattern_label(pattern_id, label)
+            self.refresh()
+
+    def _on_delete_pattern(self):
+        pattern_id = self._selected_pattern_id()
+        if pattern_id is None or not self.engine:
+            QMessageBox.information(self, "Delete Pattern",
+                                    "Select a pattern first.")
+            return
+        confirm = QMessageBox.question(
+            self, "Delete Pattern",
+            "Delete this pattern and its derived outcomes?\n\n"
+            "Raw readings and other patterns are not affected.",
+            QMessageBox.Yes | QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        self.engine.delete_pattern(pattern_id)
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    # Rebuild scheduling
+    # ------------------------------------------------------------------
+    def _on_patterns_changed(self):
+        self.refresh()
+        self._schedule_rebuild()
+
+    def _schedule_rebuild(self):
+        if not self.engine or self.engine._conn is None:
+            return
+        enabled = config_repo.get_setting(
+            self.engine._conn, "auto_rebuild_patterns", "1") == "1"
+        if not enabled:
+            self.recalc_status_label.setText(
+                "Patterns changed — run Recalculate App Brain to apply them.")
+            return
+        self.recalc_status_label.setText(
+            "Patterns changed — rebuilding the outcomes shortly…")
+        self._rebuild_timer.start()
+
+    def _auto_rebuild(self):
+        if self._recalculating:
+            self._rebuild_timer.start()
+            return
+        self._launch_recalc()
+
+    def _on_recalculate(self):
+        if not self.engine or self.engine._conn is None:
+            QMessageBox.warning(self, "Recalculate",
+                                "The database is not available.")
+            return
+        if self._recalculating:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Recalculate App Brain",
+            "Rebuild every outcome and prediction from the stored readings?\n\n"
+            "Automated clicking is suspended while this runs. Stored readings are "
+            "never deleted or modified.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        self._launch_recalc()
+
+    def _launch_recalc(self):
+        if self._recalculating:
+            return
+        self._recalculating = True
+        self.recalc_btn.setEnabled(False)
+        self.add_pattern_btn.setEnabled(False)
+        self.recalc_status_label.setText("Recalculating...")
+        self.recalc_progress_bar.setValue(0)
+        threading.Thread(target=self._recalculate_worker, daemon=True).start()
+
+    def _recalculate_worker(self):
+        def report(frac: float, message: str) -> None:
+            self.recalc_progress.emit(float(frac), str(message))
+
+        try:
+            result = self.engine.recalculate(progress=report)
+        except Exception as e:  # noqa: BLE001
+            result = {"ok": False, "error": str(e)}
+        self.recalc_finished.emit(dict(result or {}))
+
+    @Slot(float, str)
+    def _on_recalc_progress(self, frac: float, message: str):
+        self.recalc_progress_bar.setValue(int(max(0.0, min(1.0, frac)) * 100))
+        self.recalc_status_label.setText(message)
+
+    @Slot(dict)
+    def _on_recalc_finished(self, result: dict):
+        self._recalculating = False
+        self.recalc_btn.setEnabled(True)
+        self.add_pattern_btn.setEnabled(True)
+        self.recalc_progress_bar.setValue(100 if result.get("ok") else 0)
+        if result.get("ok"):
+            self.recalc_status_label.setText(
+                f"Complete — model v{result.get('model_version')}, "
+                f"{result.get('patterns', 0)} outcome rows, "
+                f"{result.get('predictions', 0)} predictions")
+        else:
+            self.recalc_status_label.setText(
+                f"Failed: {result.get('error', 'unknown error')}")
+            QMessageBox.critical(
+                self, "Recalculation Failed",
+                f"Recalculation failed:\n{result.get('error', 'unknown error')}\n\n"
+                "The previous model version was preserved.")
+        self.refresh()
+        self.recalc_finished_ui_refresh()
+
+    def recalc_finished_ui_refresh(self):
+        """Hook for the main window to refresh the dashboard after a rebuild."""
+        return
+
+    # ------------------------------------------------------------------
+    # Summary
     # ------------------------------------------------------------------
     def refresh(self):
         if not self.engine or self.engine._conn is None:
@@ -2637,11 +3124,14 @@ class LearningWidget(QWidget):
 
         predictions = summary.get("predictions") or {}
         self.model_version_label.setText(str(summary.get("model_version", 0)))
+        self.definitions_label.setText(str(summary.get("definitions", 0)))
         self.pattern_count_label.setText(str(summary.get("patterns", 0)))
         self.observed_count_label.setText(str(summary.get("observed", 0)))
 
         try:
             state = config_repo.model_status(conn)
+            if config_repo.model_is_stale(conn):
+                state = "STALE"
         except Exception:  # noqa: BLE001
             state = "UNKNOWN"
         self.model_state_label.setText(state)
@@ -2676,196 +3166,8 @@ class LearningWidget(QWidget):
             self.recent_label.setText(
                 f"No resolved predictions yet (safeguard {recent_min:.0f}%)")
 
-        min_evidence = config_repo.get_setting_int(conn, "min_evidence", 30)
-        self.evidence_label.setText(
-            f"{resolved} resolved vs {min_evidence} required "
-            f"({'sufficient' if resolved >= min_evidence else 'insufficient'})")
-
-        self._refresh_filtered_summary(conn, summary)
         self._fill_patterns()
-        self._fill_predictions()
-
-    def _refresh_filtered_summary(self, conn, overall_summary: dict) -> None:
-        """Fill the right-hand summary restricted to clickable categories."""
-        try:
-            allowed = config_repo.get_allowed_categories(conn)
-        except Exception:  # noqa: BLE001
-            allowed = []
-        if not allowed:
-            self.f_categories_label.setText("None selected — showing zeros")
-            self.f_model_version_label.setText("-")
-            self.f_readings_label.setText("0")
-            self.f_patterns_label.setText("0")
-            self.f_predictions_label.setText("0 total / 0 resolved")
-            self.f_accuracy_label.setText("-")
-            self.f_unresolved_label.setText("0")
-            self.f_recent_label.setText("-")
-            return
-
-        names: List[str] = []
-        group_labels = _group_bound_labels(conn)
-        for group_id in allowed:
-            names.append(group_labels.get(group_id, group_id))
-        self.f_categories_label.setText(", ".join(names) or "-")
-
-        try:
-            filtered = self.engine.learning_summary(group_ids=allowed)
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Error reading filtered learning summary: {e}")
-            return
-
-        self.f_model_version_label.setText(str(filtered.get("model_version", 0)))
-        self.f_readings_label.setText(f"{int(filtered.get('readings') or 0):,}")
-        self.f_patterns_label.setText(f"{int(filtered.get('patterns') or 0):,}")
-
-        predictions = filtered.get("predictions") or {}
-        total = int(predictions.get("total") or 0)
-        resolved = int(predictions.get("resolved") or 0)
-        correct = int(predictions.get("correct") or 0)
-        incorrect = int(predictions.get("incorrect") or 0)
-        self.f_predictions_label.setText(f"{total} total / {resolved} resolved")
-        accuracy = predictions.get("accuracy")
-        self.f_accuracy_label.setText(
-            f"{float(accuracy):.1f}% ({correct} correct / {incorrect} incorrect)"
-            if accuracy is not None else "-")
-        self.f_unresolved_label.setText(str(int(predictions.get("unresolved") or 0)))
-
-        recent = filtered.get("recent") or {}
-        recent_acc = recent.get("accuracy") if isinstance(recent, dict) else recent
-        recent_count = recent.get("count") if isinstance(recent, dict) else None
-        if recent_acc is not None:
-            suffix = f" over the last {int(recent_count)}" if recent_count else ""
-            self.f_recent_label.setText(f"{float(recent_acc):.1f}%{suffix}")
-        else:
-            self.f_recent_label.setText("No resolved predictions yet")
-
-    def _fill_patterns(self):
-        rows = self.engine.top_patterns(limit=200)
-        group_labels = _group_bound_labels(self.engine._conn if self.engine else None)
-
-        def fill():
-            self.patterns_table.setRowCount(len(rows))
-            for i, r in enumerate(rows):
-                opportunities = int(r.get("opportunities") or 0)
-                resolved = int(r.get("resolved") or 0)
-                correct = int(r.get("correct") or 0)
-                incorrect = int(r.get("incorrect") or 0)
-                accuracy = (100.0 * correct / resolved) if resolved else 0.0
-                group_id = str(r.get("candidate_group") or "")
-                self.patterns_table.setItem(
-                    i, 0, make_item(str(r.get("pattern_length", ""))))
-                self.patterns_table.setItem(
-                    i, 1, make_item(str(r.get("pattern_sequence", ""))))
-                self.patterns_table.setItem(
-                    i, 2, make_item(group_labels.get(group_id, group_id)))
-                self.patterns_table.setItem(i, 3, make_item(str(opportunities), opportunities))
-                self.patterns_table.setItem(i, 4, make_item(str(resolved), resolved))
-                self.patterns_table.setItem(i, 5, make_item(str(correct), correct))
-                self.patterns_table.setItem(i, 6, make_item(str(incorrect), incorrect))
-                self.patterns_table.setItem(
-                    i, 7, make_item(f"{accuracy:.1f}", accuracy))
-
-        sort_safely(self.patterns_table, fill)
-        fit_columns(self.patterns_table)
-
-    def _fill_predictions(self):
-        rows = self.engine.recent_predictions(limit=100)
-        group_labels = _group_bound_labels(self.engine._conn if self.engine else None)
-
-        def label(group_id) -> str:
-            key = str(group_id or "")
-            return group_labels.get(key, key)
-
-        def fill():
-            self.predictions_table.setRowCount(len(rows))
-            for i, r in enumerate(rows):
-                if r.get("resolved_at") is None:
-                    outcome = "unresolved"
-                elif r.get("is_correct") == 1:
-                    outcome = "correct"
-                else:
-                    outcome = f"incorrect (saw {label(r.get('actual_group')) or '?'})"
-                recent = r.get("recent_accuracy")
-                confidence = float(r.get("confidence") or 0.0)
-                resolved_count = int(r.get("resolved_count", 0))
-                self.predictions_table.setItem(
-                    i, 0, make_item(str(r.get("prediction_id", ""))))
-                self.predictions_table.setItem(
-                    i, 1, make_item(str(r.get("pattern_length", ""))))
-                self.predictions_table.setItem(
-                    i, 2, make_item(label(r.get("candidate_group"))))
-                self.predictions_table.setItem(
-                    i, 3, make_item(f"{confidence:.1f}", confidence))
-                self.predictions_table.setItem(
-                    i, 4, make_item(str(resolved_count), resolved_count))
-                if recent is not None:
-                    self.predictions_table.setItem(
-                        i, 5, make_item(f"{float(recent):.1f}", float(recent)))
-                else:
-                    self.predictions_table.setItem(i, 5, make_item("-"))
-                self.predictions_table.setItem(i, 6, make_item(outcome))
-
-        sort_safely(self.predictions_table, fill)
-        fit_columns(self.predictions_table)
-
-    # ------------------------------------------------------------------
-    def _on_recalculate(self):
-        if not self.engine or self.engine._conn is None:
-            QMessageBox.warning(self, "Recalculate", "The database is not available.")
-            return
-        confirm = QMessageBox.question(
-            self,
-            "Recalculate App Brain",
-            "Rebuild all learned patterns and predictions from the stored readings?\n\n"
-            "Automated clicking is suspended while this runs. Stored readings are "
-            "never deleted or modified.",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if confirm != QMessageBox.Yes:
-            return
-
-        self.recalc_btn.setEnabled(False)
-        self.recalc_status_label.setText("Recalculating...")
-        self.recalc_progress_bar.setValue(0)
-        threading.Thread(target=self._recalculate_worker, daemon=True).start()
-
-    def _recalculate_worker(self):
-        def report(frac: float, message: str) -> None:
-            self.recalc_progress.emit(float(frac), str(message))
-
-        try:
-            result = self.engine.recalculate(progress=report)
-        except Exception as e:  # noqa: BLE001
-            result = {"ok": False, "error": str(e)}
-        self.recalc_finished.emit(dict(result or {}))
-
-    @Slot(float, str)
-    def _on_recalc_progress(self, frac: float, message: str):
-        self.recalc_progress_bar.setValue(int(max(0.0, min(1.0, frac)) * 100))
-        self.recalc_status_label.setText(message)
-
-    @Slot(dict)
-    def _on_recalc_finished(self, result: dict):
-        self.recalc_btn.setEnabled(True)
-        self.recalc_progress_bar.setValue(100 if result.get("ok") else 0)
-        if result.get("ok"):
-            self.recalc_status_label.setText(
-                f"Complete - model v{result.get('model_version')}, "
-                f"{result.get('patterns', 0)} patterns, "
-                f"{result.get('predictions', 0)} predictions")
-        else:
-            self.recalc_status_label.setText(
-                f"Failed: {result.get('error', 'unknown error')}")
-            QMessageBox.critical(
-                self, "Recalculation Failed",
-                f"Recalculation failed:\n{result.get('error', 'unknown error')}\n\n"
-                "The previous model version was preserved.")
-        self.refresh()
-        self.recalc_finished_ui_refresh()
-
-    def recalc_finished_ui_refresh(self):
-        """Hook for the main window to refresh the dashboard after a rebuild."""
-        return
+        self._fill_outcomes()
 
 
 class AutomationWidget(QWidget):

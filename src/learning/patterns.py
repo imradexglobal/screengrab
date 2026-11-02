@@ -145,6 +145,10 @@ class PatternStat:
     recent: Deque[bool] = field(default_factory=lambda: deque(maxlen=DEFAULT_RECENT_WINDOW))
     first_seen: Optional[str] = None
     last_seen: Optional[str] = None
+    #: ``"range"`` for number-range patterns, ``"movement"`` for UP/DOWN/FLAT.
+    pattern_kind: str = "range"
+    #: Manual ``pattern_definitions.pattern_id`` this row belongs to.
+    definition_id: Optional[int] = None
 
     @property
     def accuracy(self) -> Optional[float]:
@@ -171,6 +175,8 @@ class PatternStat:
             "recent_outcomes": [1 if x else 0 for x in self.recent],
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
+            "pattern_kind": self.pattern_kind,
+            "definition_id": self.definition_id,
         }
 
 
@@ -193,6 +199,12 @@ class Prediction:
     actual_group: Optional[str] = None
     resolved_at: Optional[str] = None
     is_correct: Optional[bool] = None
+    #: ``"range"`` or ``"movement"``.
+    pattern_kind: str = "range"
+    definition_id: Optional[int] = None
+    #: Likely next movement shown alongside a range prediction.
+    next_movement: Optional[str] = None
+    next_movement_confidence: Optional[float] = None
 
     def as_dict(self) -> Dict:
         return asdict(self)
@@ -220,6 +232,8 @@ class LearningEngine:
         ambiguity_min_support: int = DEFAULT_AMBIGUITY_MIN_SUPPORT,
         wilson_z: float = DEFAULT_WILSON_Z,
         max_sequence_gap: Optional[float] = DEFAULT_MAX_SEQUENCE_GAP,
+        allowed_sequences: Optional[Dict[str, int]] = None,
+        pattern_kind: str = "range",
     ):
         self._abbrev = abbreviation_fn or (lambda gid: str(gid))
         self.pattern_lengths: Tuple[int, ...] = tuple(
@@ -234,6 +248,14 @@ class LearningEngine:
         self.max_sequence_gap = (
             None if max_sequence_gap is None else float(max_sequence_gap)
         )
+        #: When not ``None`` only these ``sequence_text -> definition_id``
+        #: patterns are learned and predicted.  ``None`` keeps the legacy
+        #: "learn every suffix" behaviour used by the pure-engine tests.
+        self.allowed_sequences: Optional[Dict[str, int]] = (
+            None if allowed_sequences is None
+            else {str(k): int(v) for k, v in allowed_sequences.items()}
+        )
+        self.pattern_kind = str(pattern_kind)
 
         self._stats: Dict[Tuple[int, str, str], PatternStat] = {}
         self.sequence: List[str] = []
@@ -291,7 +313,13 @@ class LearningEngine:
         return (current - previous).total_seconds() > self.max_sequence_gap
 
     def _get_stat(self, length: int, sequence: str, candidate: str,
-                  now: Optional[str] = None) -> PatternStat:
+                  now: Optional[str] = None,
+                  definition_id: Optional[int] = None) -> Optional[PatternStat]:
+        if self.allowed_sequences is not None:
+            if sequence not in self.allowed_sequences:
+                return None
+            if definition_id is None:
+                definition_id = self.allowed_sequences[sequence]
         key = (length, sequence, candidate)
         stat = self._stats.get(key)
         if stat is None:
@@ -299,10 +327,14 @@ class LearningEngine:
                 pattern_length=length,
                 pattern_sequence=sequence,
                 candidate_group=candidate,
+                pattern_kind=self.pattern_kind,
+                definition_id=definition_id,
             )
             stat.recent = deque(maxlen=self.recent_window)
             stat.first_seen = now
             self._stats[key] = stat
+        elif definition_id is not None and stat.definition_id is None:
+            stat.definition_id = definition_id
         if now:
             stat.last_seen = now
         return stat
@@ -346,17 +378,18 @@ class LearningEngine:
             p.actual_group = group_id
             p.resolved_at = now
             p.is_correct = (p.candidate_group == group_id)
-            key = (p.pattern_length, p.pattern_sequence, p.candidate_group)
             stat = self._get_stat(p.pattern_length, p.pattern_sequence,
-                                  p.candidate_group, now)
-            stat.resolved += 1
-            if p.is_correct:
-                stat.correct += 1
-            else:
-                stat.incorrect += 1
-            stat.recent.append(bool(p.is_correct))
+                                  p.candidate_group, now,
+                                  definition_id=p.definition_id)
+            if stat is not None:
+                stat.resolved += 1
+                if p.is_correct:
+                    stat.correct += 1
+                else:
+                    stat.incorrect += 1
+                stat.recent.append(bool(p.is_correct))
+                result.updated_stats.append(stat.to_row())
             result.resolved = p
-            result.updated_stats.append(stat.to_row())
             self._pending = None
 
         # 2) update counters for the transition just observed
@@ -369,7 +402,12 @@ class LearningEngine:
                     continue
                 pattern_groups = self.sequence[prev_idx - length + 1: prev_idx + 1]
                 sequence_text = self._sequence_text(pattern_groups)
+                if (self.allowed_sequences is not None
+                        and sequence_text not in self.allowed_sequences):
+                    continue
                 stat = self._get_stat(length, sequence_text, group_id, now)
+                if stat is None:
+                    continue
                 stat.opportunities += 1
                 stat.last_seen = now
                 result.updated_stats.append(stat.to_row())
@@ -387,6 +425,8 @@ class LearningEngine:
         now: Optional[str] = None,
         basis_reading_id: Optional[int] = None,
         expected_reading_id: Optional[int] = None,
+        next_movement: Optional[str] = None,
+        next_movement_confidence: Optional[float] = None,
     ) -> Optional[Prediction]:
         """Build (and internally register) the prediction for the next category."""
         candidate = self.select_candidate()
@@ -394,7 +434,7 @@ class LearningEngine:
             self._pending = None
             return None
 
-        length, sequence_text, group, stat, total_opp = candidate
+        length, sequence_text, group, stat, total_opp, definition_id = candidate
         prediction = Prediction(
             pattern_length=length,
             pattern_sequence=sequence_text,
@@ -407,26 +447,34 @@ class LearningEngine:
             basis_reading_id=basis_reading_id,
             expected_reading_id=expected_reading_id,
             total_opportunities=total_opp,
+            pattern_kind=self.pattern_kind,
+            definition_id=definition_id,
+            next_movement=next_movement,
+            next_movement_confidence=next_movement_confidence,
         )
         self._pending = prediction
         return prediction
 
     def select_candidate(
         self,
-    ) -> Optional[Tuple[int, str, str, PatternStat, int]]:
-        """Return ``(length, sequence, group, stat, total_opportunities)``.
+    ) -> Optional[Tuple[int, str, str, PatternStat, int, Optional[int]]]:
+        """Return ``(length, sequence, group, stat, total_opportunities, definition_id)``.
 
         Applies the documented selection rule described in the module docstring.
         Returns ``None`` when no pattern qualifies or when patterns conflict.
         """
         n = len(self.sequence)
-        ranked: List[Tuple[float, int, int, int, Tuple[int, str, str, PatternStat, int]]] = []
+        ranked: List[Tuple[float, int, int, int, Tuple[
+            int, str, str, PatternStat, int, Optional[int]]]] = []
 
         for length in self.pattern_lengths:
             if n < length:
                 continue
             pattern_groups = self.sequence[n - length: n]
             sequence_text = self._sequence_text(pattern_groups)
+            if (self.allowed_sequences is not None
+                    and sequence_text not in self.allowed_sequences):
+                continue
 
             # gather all candidates recorded for this pattern
             candidates: List[PatternStat] = [
@@ -454,9 +502,14 @@ class LearningEngine:
             support = wilson_lower_bound(
                 best.opportunities, total_opportunities, self.wilson_z)
 
+            definition_id = best.definition_id
+            if definition_id is None and self.allowed_sequences is not None:
+                definition_id = self.allowed_sequences.get(sequence_text)
+
             ranked.append(
                 (support, total_opportunities, length, self._ordinal(best.candidate_group),
-                 (length, sequence_text, best.candidate_group, best, total_opportunities))
+                 (length, sequence_text, best.candidate_group, best,
+                  total_opportunities, definition_id))
             )
 
         if not ranked:
@@ -515,6 +568,8 @@ def replay(
     min_pattern_opportunities: int = 1,
     timestamps: Optional[Sequence[str]] = None,
     reading_ids: Optional[Sequence[int]] = None,
+    allowed_sequences: Optional[Dict[str, int]] = None,
+    pattern_kind: str = "range",
 ) -> Tuple[LearningEngine, List[Prediction]]:
     """Replay a whole sequence chronologically and return every prediction.
 
@@ -526,6 +581,8 @@ def replay(
         pattern_lengths=pattern_lengths,
         recent_window=recent_window,
         min_pattern_opportunities=min_pattern_opportunities,
+        allowed_sequences=allowed_sequences,
+        pattern_kind=pattern_kind,
     )
     predictions: List[Prediction] = []
     for idx, gid in enumerate(group_ids):

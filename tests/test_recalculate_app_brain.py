@@ -13,14 +13,13 @@ import pytest
 from src.config.repository import (
     current_model_version,
     get_setting,
-    load_range_config,
     model_is_stale,
     set_setting,
 )
 from src.database.init_db import REGION_A_ID, initialise_database
 from src.learning import repository as learn_repo
 from src.learning import rebuild as rebuild_mod
-from src.learning.patterns import LearningEngine
+from src.learning.manual_brain import ManualBrain
 from src.learning.rebuild import recalculate_app_brain
 
 #: A numeric value firmly inside each default group.
@@ -73,24 +72,34 @@ def _sequence(repeats=60):
     return ["g1", "g2", "g3", "g4"] * repeats
 
 
+def _add_definition(conn, tokens=("g1", "g2", "g3", "g4"), kind="range",
+                    label="test pattern"):
+    """Add one user-defined pattern; nothing is learned without it."""
+    return learn_repo.create_pattern_definition(conn, kind, tokens, label)
+
+
 def _db_stats(conn, model_version):
     return {
-        (r["pattern_length"], r["pattern_sequence"], r["candidate_group"]):
+        (r["pattern_kind"], r["pattern_length"], r["pattern_sequence"],
+         r["candidate_group"]):
             (r["opportunities"], r["resolved"], r["correct"], r["incorrect"])
         for r in conn.execute(
-            "SELECT pattern_length, pattern_sequence, candidate_group, "
-            "opportunities, resolved, correct, incorrect FROM pattern_stats "
-            "WHERE model_version = ? ORDER BY pattern_length, pattern_sequence, "
+            "SELECT pattern_kind, pattern_length, pattern_sequence, "
+            "candidate_group, opportunities, resolved, correct, incorrect "
+            "FROM pattern_stats WHERE model_version = ? "
+            "ORDER BY pattern_kind, pattern_length, pattern_sequence, "
             "candidate_group",
             (model_version,))
     }
 
 
-def _engine_stats(engine):
+def _brain_stats(brain):
     return {
-        (s.pattern_length, s.pattern_sequence, s.candidate_group):
-            (s.opportunities, s.resolved, s.correct, s.incorrect)
-        for s in engine.stats.values()
+        (row["pattern_kind"], row["pattern_length"], row["pattern_sequence"],
+         row["candidate_group"]):
+            (row["opportunities"], row["resolved"], row["correct"],
+             row["incorrect"])
+        for row in brain.all_stat_rows()
     }
 
 
@@ -107,6 +116,7 @@ class TestSuccessfulRecalculation:
     def test_publishes_a_new_valid_model(self, temp_db):
         conn = temp_db
         groups = _seed(conn, _sequence())
+        _add_definition(conn)
 
         result = recalculate_app_brain(conn)
 
@@ -131,6 +141,7 @@ class TestSuccessfulRecalculation:
     def test_recalculation_is_idempotent(self, temp_db):
         conn = temp_db
         _seed(conn, _sequence())
+        _add_definition(conn)
 
         first = recalculate_app_brain(conn)
         second = recalculate_app_brain(conn)
@@ -159,6 +170,7 @@ class TestFailurePath:
                                                          monkeypatch):
         conn = temp_db
         _seed(conn, _sequence())
+        _add_definition(conn)
 
         good = recalculate_app_brain(conn)
         assert good["ok"] is True
@@ -168,14 +180,14 @@ class TestFailurePath:
         set_setting(conn, "auto_click_enabled", "1")
         conn.commit()
 
-        class _BoomEngine:
+        class _BoomBrain:
             def __init__(self, *args, **kwargs):
                 pass
 
             def observe(self, *args, **kwargs):
                 raise RuntimeError("forced failure")
 
-        monkeypatch.setattr(rebuild_mod, "LearningEngine", _BoomEngine)
+        monkeypatch.setattr(rebuild_mod, "ManualBrain", _BoomBrain)
 
         result = recalculate_app_brain(conn)
 
@@ -206,20 +218,25 @@ class TestReloadDeterminism:
     def test_reloaded_engine_matches_a_fresh_replay(self, temp_db):
         conn = temp_db
         groups = _seed(conn, _sequence())
+        _add_definition(conn)
 
         result = recalculate_app_brain(conn)
         assert result["ok"] is True
         model_version = result["model_version"]
 
-        config = load_range_config(conn)
-        fresh = LearningEngine(abbreviation_fn=config.abbreviation)
-        for gid in groups:
-            fresh.observe(gid)
+        definitions = learn_repo.enabled_pattern_definitions(conn)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        fresh = ManualBrain(definitions)
+        for i, gid in enumerate(groups):
+            fresh.observe(
+                gid, _GROUP_VALUE[gid],
+                now=(base + timedelta(seconds=i)).isoformat())
 
         # The published pattern statistics equal a from-scratch replay.
-        assert _db_stats(conn, model_version) == _engine_stats(fresh)
+        assert _db_stats(conn, model_version) == _brain_stats(fresh)
 
         # Rehydrating from the database yields the same next prediction.
-        loaded = learn_repo.load_engine_state(
-            conn, model_version, abbreviation_fn=config.abbreviation)
-        assert loaded.predict_next() == fresh.predict_next()
+        loaded = learn_repo.load_manual_brain(
+            conn, model_version, definitions)
+        assert loaded.range_engine.predict_next() == \
+            fresh.range_engine.predict_next()

@@ -45,6 +45,7 @@ _V2_TABLES = {
     "pattern_stats", "predictions", "click_audit", "diagnostics",
 }
 _V3_TABLES = {"region_b_readings"}
+_V4_TABLES = {"pattern_definitions"}
 
 
 def _cleanup(tmp):
@@ -82,6 +83,7 @@ def _scan(conn, canonical, mode, region_id=REGION_A_ID):
         min_confidence=70.0,
         mode=mode,
         previous_canonical=previous_canonical,
+        require_range=(region_id != REGION_B_ID),
     )
     if evaluation.is_valid:
         learn_repo.insert_reading(
@@ -122,6 +124,36 @@ class TestSaveModes:
         assert ev1.status == pipeline.VALID
         assert ev2.status == pipeline.DUPLICATE
         assert _count(conn, REGION_A_ID) == 1
+
+
+class TestRegionBRangeBypass:
+    def test_region_b_stores_zero_even_though_it_is_out_of_range(self, temp_db):
+        conn = temp_db
+        evaluation = _scan(conn, "0.00", pipeline.MODE_EVERY,
+                           region_id=REGION_B_ID)
+        assert evaluation.status == pipeline.VALID
+        assert evaluation.group_id is None
+        row = conn.execute(
+            "SELECT group_id, numeric_value FROM readings WHERE region_id = ?",
+            (REGION_B_ID,),
+        ).fetchone()
+        assert row is not None
+        assert row["group_id"] is None
+        assert row["numeric_value"] == pytest.approx(0.0)
+
+    def test_region_b_still_rejects_non_numeric_text(self, temp_db):
+        conn = temp_db
+        evaluation = _scan(conn, "NGN", pipeline.MODE_EVERY,
+                           region_id=REGION_B_ID)
+        assert evaluation.status == pipeline.INVALID_TEXT
+        assert _count(conn, REGION_B_ID) == 0
+
+    def test_region_a_still_rejects_out_of_range(self, temp_db):
+        conn = temp_db
+        evaluation = _scan(conn, "0.00", pipeline.MODE_EVERY,
+                           region_id=REGION_A_ID)
+        assert evaluation.status == pipeline.OUT_OF_RANGE
+        assert _count(conn, REGION_A_ID) == 0
 
 
 class TestRegionAGateCounting:
@@ -238,6 +270,61 @@ class TestLegacyMigration:
         finally:
             conn2.close()
 
+    def test_upgrade_purges_only_legacy_derived_rows(self, temp_db):
+        conn = temp_db
+        conn.execute(
+            """INSERT INTO pattern_stats
+               (model_version, pattern_length, pattern_sequence,
+                candidate_group, opportunities, pattern_kind, definition_id)
+               VALUES (1, 4, 'g1,g2,g3,g4', 'g1', 10, 'range', NULL)"""
+        )
+        conn.execute(
+            "UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'")
+        conn.commit()
+        db_file = conn.execute("PRAGMA database_list").fetchone()["file"]
+
+        conn2 = initialise_database(db_file)
+        try:
+            assert conn2.execute(
+                "SELECT COUNT(*) AS n FROM pattern_stats "
+                "WHERE definition_id IS NULL"
+            ).fetchone()["n"] == 0
+        finally:
+            conn2.close()
+
+    def test_repeated_initialise_keeps_manual_rows_and_settings(self, temp_db):
+        conn = temp_db
+        pattern_id = learn_repo.create_pattern_definition(
+            conn, "range", ("g1", "g2"))
+        conn.execute(
+            """INSERT INTO pattern_stats
+               (model_version, pattern_length, pattern_sequence,
+                candidate_group, opportunities, pattern_kind, definition_id)
+               VALUES (1, 2, 'g1,g2', 'g1', 10, 'range', ?)""",
+            (pattern_id,),
+        )
+        conn.execute(
+            "UPDATE settings SET value = '0' WHERE key = 'model_stale'")
+        conn.execute(
+            "UPDATE settings SET value = '1' WHERE key = 'auto_click_enabled'")
+        conn.commit()
+        db_file = conn.execute("PRAGMA database_list").fetchone()["file"]
+
+        conn2 = initialise_database(db_file)
+        try:
+            assert conn2.execute(
+                "SELECT value FROM settings WHERE key = 'model_stale'"
+            ).fetchone()["value"] == "0"
+            assert conn2.execute(
+                "SELECT value FROM settings WHERE key = 'auto_click_enabled'"
+            ).fetchone()["value"] == "1"
+            assert conn2.execute(
+                "SELECT COUNT(*) AS n FROM pattern_stats "
+                "WHERE definition_id = ?", (pattern_id,)
+            ).fetchone()["n"] == 1
+        finally:
+            conn2.close()
+
     def test_repeated_initialise_drops_nothing(self, temp_db):
         conn = temp_db
         db_file = conn.execute("PRAGMA database_list").fetchone()["file"]
@@ -250,10 +337,11 @@ class TestLegacyMigration:
             assert _V1_TABLES <= tables
             assert _V2_TABLES <= tables
             assert _V3_TABLES <= tables
+            assert _V4_TABLES <= tables
             versions = {
                 r["value"] for r in conn2.execute(
                     "SELECT value FROM schema_meta WHERE key='schema_version'")
             }
-            assert versions == {"3"}
+            assert versions == {"4"}
         finally:
             conn2.close()

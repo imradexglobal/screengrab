@@ -27,9 +27,18 @@ v3  Adds ``region_b_readings``: Region B may now be activated and its
     Region A history, the learning model, the statistics or the automation
     gate, and it can never be read back into ``readings``.
 
-Nothing in v1 or v2 is dropped, truncated or rewritten.  Legacy ``detections``
-rows are *copied* into ``readings`` (source='migrated') preserving their
-original region identifier in ``legacy_region_id``.
+v4  Adds manual pattern definitions.  The app no longer auto-generates every
+    observed pattern; only patterns explicitly added by the user are learned
+    and scored.  ``pattern_definitions`` holds those patterns and every
+    derived row carries ``pattern_kind`` plus ``definition_id`` so range and
+    movement patterns can share the existing statistics table.  Legacy
+    auto-generated pattern rows (``definition_id IS NULL``) are purged because
+    they are derived data and can never be used by the manual brain again.
+    Raw readings, predictions, settings and Region B rows are never deleted.
+
+Nothing in v1, v2 or v3 is dropped, truncated or rewritten.  Legacy
+``detections`` rows are *copied* into ``readings`` (source='migrated')
+preserving their original region identifier in ``legacy_region_id``.
 """
 
 import json
@@ -44,7 +53,7 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Fixed identifiers of the two region slots (spec section 5).
 REGION_A_ID = "region-A"
@@ -295,6 +304,20 @@ def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str,
+                   definition: str) -> None:
+    """Add ``column`` to ``table`` when it is not already present.
+
+    SQLite has no ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``, so the current
+    shape is inspected first.  This keeps the migration idempotent.
+    """
+    columns = {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 # ---------------------------------------------------------------------------
 # v1 tables (kept byte-for-byte compatible)
 # ---------------------------------------------------------------------------
@@ -535,6 +558,26 @@ CREATE INDEX IF NOT EXISTS idx_region_b_id
     ON region_b_readings (reading_id);
 """
 
+# ---------------------------------------------------------------------------
+# v4 tables
+# ---------------------------------------------------------------------------
+
+_V4_TABLES = """
+CREATE TABLE IF NOT EXISTS pattern_definitions (
+    pattern_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    tokens TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (kind, tokens)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_def_enabled
+    ON pattern_definitions (enabled);
+"""
+
 #: Default application settings added in v2.
 DEFAULT_SETTINGS: Dict[str, str] = {
     # v1 keys (unchanged defaults)
@@ -561,6 +604,9 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "algorithm_version": "1.0",
     "rebuild_in_progress": "0",        # 1 while "Recalculate App Brain" runs
     "require_window_verification": "0",  # optional extra click precondition
+    # v4 keys
+    "auto_rebuild_patterns": "1",      # rebuild outcomes after a pattern edit
+    "region_b_save_mode": "every",     # Region B is store-only; keep every value
 }
 
 
@@ -585,6 +631,12 @@ def initialise_database(db_path: Path = DB_PATH) -> sqlite3.Connection:
     # ---- v3 tables (Region B store-only readings) ------------------------
     conn.executescript(_V3_TABLES)
 
+    # ---- v4 tables (manual pattern definitions) --------------------------
+    conn.executescript(_V4_TABLES)
+
+    # ---- v4 column additions / legacy pattern purge ----------------------
+    _migrate_v4(conn)
+
     # ---- defaults --------------------------------------------------------
     now = datetime.now(timezone.utc).isoformat()
     for key, value in DEFAULT_SETTINGS.items():
@@ -603,6 +655,44 @@ def initialise_database(db_path: Path = DB_PATH) -> sqlite3.Connection:
     _meta_set(conn, "schema_version", str(SCHEMA_VERSION))
     conn.commit()
     return conn
+
+
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    """Upgrade the derived learning tables to the manual-pattern model.
+
+    The application used to auto-generate every observed pattern suffix.  Those
+    rows are *derived* data: they are purged once so the manual brain never
+    sees them again.  Raw readings, predictions, settings and Region B rows are
+    left untouched.
+    """
+    _ensure_column(conn, "pattern_stats", "pattern_kind",
+                   "TEXT NOT NULL DEFAULT 'range'")
+    _ensure_column(conn, "pattern_stats", "definition_id", "INTEGER")
+    _ensure_column(conn, "predictions", "pattern_kind",
+                   "TEXT NOT NULL DEFAULT 'range'")
+    _ensure_column(conn, "predictions", "definition_id", "INTEGER")
+    _ensure_column(conn, "predictions", "next_movement", "TEXT")
+    _ensure_column(conn, "predictions", "next_movement_confidence", "REAL")
+
+    # The purge and the safety flags are a one-shot upgrade, not something to
+    # repeat on every launch.  ``schema_version`` is written after this function
+    # returns, so anything other than "4" means this database is being upgraded.
+    if _meta_get(conn, "schema_version") != "4":
+        # Purge legacy auto-generated pattern rows.  ``definition_id`` is NULL
+        # for every row that predates the manual model.
+        conn.execute("DELETE FROM pattern_stats WHERE definition_id IS NULL")
+        # The old model cannot produce manual predictions any more, so it must
+        # be rebuilt before automated clicking may resume.
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE settings SET value = '1', updated_at = ? "
+            "WHERE key = 'model_stale'", (now,),
+        )
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = ? "
+            "WHERE key = 'auto_click_enabled'", (now,),
+        )
+    conn.commit()
 
 
 def _ensure_default_groups(conn: sqlite3.Connection) -> None:
