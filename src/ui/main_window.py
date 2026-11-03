@@ -2585,7 +2585,7 @@ class LearningWidget(QWidget):
         self.kind_combo = QComboBox()
         self.kind_combo.addItem("Number range", "range")
         self.kind_combo.addItem("Movement", "movement")
-        self.kind_combo.currentIndexChanged.connect(self._update_builder_hint)
+        self.kind_combo.currentIndexChanged.connect(self._update_expected_options)
         self.tokens_edit = QLineEdit()
         self.tokens_edit.returnPressed.connect(self._on_add_pattern)
         self._pattern_tokens = []
@@ -2642,7 +2642,7 @@ class LearningWidget(QWidget):
                      "Pick the expected next range or movement.")
         builder_layout.addRow("", self.builder_hint)
         self._update_expected_options()
-        self._update_builder_hint()
+        self._update_expected_options()
         self._refresh_token_range_buttons()
 
         builder_buttons = QHBoxLayout()
@@ -2759,7 +2759,7 @@ class LearningWidget(QWidget):
         self.refresh_btn.clicked.connect(self.refresh)
         layout.addWidget(self.refresh_btn)
 
-        self._update_builder_hint()
+        self._update_expected_options()
 
     # ------------------------------------------------------------------
     # Builder helpers
@@ -2807,6 +2807,54 @@ class LearningWidget(QWidget):
             self.builder_hint.setText(
                 "Use the lower bound of each configured range, separated by "
                 "commas (the group id, e.g. g1, is accepted too)." + suffix)
+
+    def _add_token(self, token: str) -> None:
+        """Append a token (UP/DOWN/FLAT or a range id) to the builder."""
+        self._pattern_tokens.append(token)
+        self.tokens_edit.setText(", ".join(self._pattern_tokens))
+        self._refresh_token_range_buttons()
+
+    def _remove_last_token(self) -> None:
+        """Remove the most recently appended token."""
+        if not self._pattern_tokens:
+            return
+        self._pattern_tokens.pop()
+        self.tokens_edit.setText(", ".join(self._pattern_tokens))
+        self._refresh_token_range_buttons()
+
+    def _clear_tokens(self) -> None:
+        """Clear every token from the builder."""
+        self._pattern_tokens = []
+        self.tokens_edit.clear()
+        self._refresh_token_range_buttons()
+
+    def _refresh_token_range_buttons(self) -> None:
+        """Show quick range-id buttons only for number-range patterns."""
+        kind = self.kind_combo.currentData()
+        show = (kind == "range")
+        self.token_range_container.setVisible(show)
+        if not show:
+            return
+        for btn in self.token_range_buttons:
+            btn.setParent(None)
+            btn.deleteLater()
+        self.token_range_buttons.clear()
+        if not self.engine or self.engine._conn is None:
+            return
+        try:
+            groups = config_repo.load_groups(self.engine._conn)
+            group_labels = _group_bound_labels(self.engine._conn)
+        except Exception:  # noqa: BLE001
+            return
+        layout = self.token_range_container.layout()
+        for g in groups:
+            label = group_labels.get(g.group_id, g.name or g.group_id)
+            btn = make_button(label, "quiet")
+            btn.clicked.connect(
+                lambda _checked=False, gid=g.group_id: self._add_token(gid))
+            layout.addWidget(btn)
+            self.token_range_buttons.append(btn)
+        layout.addStretch(1)
 
     def _parse_tokens(self, kind: str) -> List[str]:
         text = self.tokens_edit.text().strip()
@@ -3149,6 +3197,8 @@ class LearningWidget(QWidget):
             self.engine.update_pattern_expected(pattern_id, ek, ev)
             self.refresh()
             self._schedule_rebuild()
+
+    def _on_rename_pattern(self):
         pattern_id = self._selected_pattern_id()
         if pattern_id is None or not self.engine:
             QMessageBox.information(self, "Rename Pattern",
