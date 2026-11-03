@@ -61,6 +61,7 @@ from src.automation.clicker import BLOCK_EXPLANATIONS, explain
 from src.capture.screen_capture import logical_rect_to_physical, physical_rect_to_logical
 from src.config import repository as config_repo
 from src.config.ranges import Group
+from src.learning import repository as learn_repo
 from src.database.init_db import (
     DB_PATH,
     REGION_A_ID,
@@ -2587,17 +2588,62 @@ class LearningWidget(QWidget):
         self.kind_combo.currentIndexChanged.connect(self._update_builder_hint)
         self.tokens_edit = QLineEdit()
         self.tokens_edit.returnPressed.connect(self._on_add_pattern)
+        self._pattern_tokens = []
         self.label_edit = QLineEdit()
         self.label_edit.setPlaceholderText("Optional name, e.g. morning cycle")
+        self.expected_kind_combo = QComboBox()
+        self.expected_kind_combo.addItem("Not set", None)
+        self.expected_kind_combo.addItem("Expect range", "range")
+        self.expected_kind_combo.addItem("Expect movement", "movement")
+        self.expected_kind_combo.currentIndexChanged.connect(self._update_expected_options)
+        self.expected_value_combo = QComboBox()
+        self.expected_value_combo.setEnabled(False)
         self.builder_hint = help_text("")
         add_help_row(builder_layout, "Pattern type", self.kind_combo,
                      "A number-range pattern uses the configured ranges. A "
                      "movement pattern uses UP, DOWN and FLAT.")
+        token_buttons_row = QHBoxLayout()
+        self.up_token_btn = make_button("UP", "quiet")
+        self.down_token_btn = make_button("DOWN", "quiet")
+        self.flat_token_btn = make_button("FLAT", "quiet")
+        self.up_token_btn.clicked.connect(lambda: self._add_token("UP"))
+        self.down_token_btn.clicked.connect(lambda: self._add_token("DOWN"))
+        self.flat_token_btn.clicked.connect(lambda: self._add_token("FLAT"))
+        token_buttons_row.addWidget(self.up_token_btn)
+        token_buttons_row.addWidget(self.down_token_btn)
+        token_buttons_row.addWidget(self.flat_token_btn)
+        token_buttons_row.addStretch(1)
+        self.token_range_container = QWidget()
+        token_range_layout = QHBoxLayout(self.token_range_container)
+        token_range_layout.setContentsMargins(0, 0, 0, 0)
+        token_range_layout.setSpacing(4)
+        self.token_range_buttons = []
+        token_range_layout.addStretch(1)
+        self.token_range_container.setVisible(False)
+        add_help_row(builder_layout, "Add tokens", token_buttons_row,
+                     "Click to append tokens to the pattern.")
+        builder_layout.addRow("", self.token_range_container)
         add_help_row(builder_layout, "Tokens", self.tokens_edit,
-                     "Enter 2-12 tokens separated by commas.")
+                     "Current sequence. Use Remove Last/Clear below.")
+        token_edit_buttons = QHBoxLayout()
+        self.remove_last_token_btn = make_button("Remove Last", "quiet")
+        self.remove_last_token_btn.clicked.connect(self._remove_last_token)
+        self.clear_tokens_btn = make_button("Clear", "quiet")
+        self.clear_tokens_btn.clicked.connect(self._clear_tokens)
+        token_edit_buttons.addWidget(self.remove_last_token_btn)
+        token_edit_buttons.addWidget(self.clear_tokens_btn)
+        token_edit_buttons.addStretch(1)
+        builder_layout.addRow("", token_edit_buttons)
         add_help_row(builder_layout, "Label", self.label_edit,
                      "An optional friendly name shown in the table.")
+        add_help_row(builder_layout, "Expected outcome", self.expected_kind_combo,
+                     "Set the outcome you expect when this pattern shows.")
+        add_help_row(builder_layout, "Expected value", self.expected_value_combo,
+                     "Pick the expected next range or movement.")
         builder_layout.addRow("", self.builder_hint)
+        self._update_expected_options()
+        self._update_builder_hint()
+        self._refresh_token_range_buttons()
 
         builder_buttons = QHBoxLayout()
         self.add_pattern_btn = make_button(
@@ -2616,12 +2662,11 @@ class LearningWidget(QWidget):
             "Tick a pattern to learn it, untick to pause it. Only enabled "
             "patterns are used for predictions. Click a header to sort."))
         self.patterns_table = PlaceholderTable(
-            0, 9,
+            0, 11,
             "No patterns defined yet — add one above to start learning.")
         self.patterns_table.setHorizontalHeaderLabels(
-            ["On", "ID", "Type", "Pattern", "Length", "Matches",
-             "Next range", "Next movement", "Accuracy %"])
-        configure_fit_table(self.patterns_table, min_height=260)
+            ["On", "ID", "Type", "Pattern", "Length", "Shown", "Hit", "Miss", "Expected", "Next range", "Next movement"])
+        configure_fit_table(self.patterns_table, min_height=260, interactive=True)
         self.patterns_table.setSortingEnabled(True)
         self.patterns_table.itemSelectionChanged.connect(self._on_pattern_selected)
         self.patterns_table.itemChanged.connect(self._on_pattern_item_changed)
@@ -2633,17 +2678,21 @@ class LearningWidget(QWidget):
             "Toggle whether the selected pattern is learned.")
         self.rename_pattern_btn = make_button(
             "Rename", "quiet", "Change the selected pattern's label.")
+        self.set_expected_btn = make_button(
+            "Set Expected", "quiet", "Set or clear the expected outcome for this pattern.")
         self.delete_pattern_btn = make_button(
             "Delete Pattern", "danger",
             "Delete the selected pattern and its derived outcomes.")
         for button in (self.toggle_pattern_btn, self.rename_pattern_btn,
-                       self.delete_pattern_btn):
+                       self.set_expected_btn, self.delete_pattern_btn):
             button.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.toggle_pattern_btn.clicked.connect(self._on_toggle_pattern)
         self.rename_pattern_btn.clicked.connect(self._on_rename_pattern)
+        self.set_expected_btn.clicked.connect(self._on_set_expected)
         self.delete_pattern_btn.clicked.connect(self._on_delete_pattern)
         pattern_buttons.addWidget(self.toggle_pattern_btn)
         pattern_buttons.addWidget(self.rename_pattern_btn)
+        pattern_buttons.addWidget(self.set_expected_btn)
         pattern_buttons.addWidget(self.delete_pattern_btn)
         pattern_buttons.addStretch(1)
         patterns_layout.addLayout(pattern_buttons)
@@ -2663,7 +2712,7 @@ class LearningWidget(QWidget):
             0, 5, "No next-range outcomes recorded for this pattern yet.")
         self.range_outcomes_table.setHorizontalHeaderLabels(
             ["Next range", "Opportunities", "Resolved", "Correct", "Accuracy %"])
-        configure_fit_table(self.range_outcomes_table, min_height=170)
+        configure_fit_table(self.range_outcomes_table, min_height=170, interactive=True)
         outcomes_layout.addWidget(self.range_outcomes_table)
 
         outcomes_layout.addWidget(QLabel("Next movement"))
@@ -2672,7 +2721,7 @@ class LearningWidget(QWidget):
         self.movement_outcomes_table.setHorizontalHeaderLabels(
             ["Next movement", "Opportunities", "Resolved", "Correct",
              "Accuracy %"])
-        configure_fit_table(self.movement_outcomes_table, min_height=170)
+        configure_fit_table(self.movement_outcomes_table, min_height=170, interactive=True)
         outcomes_layout.addWidget(self.movement_outcomes_table)
         layout.addWidget(outcomes_group, 1)
 
@@ -2724,7 +2773,26 @@ class LearningWidget(QWidget):
             return ""
         return ", ".join(f"{float(g.lower_bound):.2f}" for g in groups)
 
-    def _update_builder_hint(self):
+    def _update_expected_options(self):
+        kind = self.expected_kind_combo.currentData()
+        self.expected_value_combo.clear()
+        if kind == "movement":
+            self.expected_value_combo.setEnabled(True)
+            for mv in ("UP", "DOWN", "FLAT"):
+                self.expected_value_combo.addItem(mv, mv)
+        elif kind == "range":
+            self.expected_value_combo.setEnabled(True)
+            if self.engine and self.engine._conn is not None:
+                try:
+                    groups = config_repo.load_groups(self.engine._conn)
+                    group_labels = _group_bound_labels(self.engine._conn)
+                    for g in groups:
+                        label = group_labels.get(g.group_id, g.name or g.group_id)
+                        self.expected_value_combo.addItem(label, g.group_id)
+                except Exception:
+                    pass
+        else:
+            self.expected_value_combo.setEnabled(False)
         kind = self.kind_combo.currentData()
         if kind == "movement":
             self.tokens_edit.setPlaceholderText("e.g. UP, DOWN, UP, DOWN")
@@ -2794,7 +2862,19 @@ class LearningWidget(QWidget):
         kind = self.kind_combo.currentData()
         try:
             tokens = self._parse_tokens(kind)
+            exp_kind = self.expected_kind_combo.currentData()
+            exp_val = self.expected_value_combo.currentData() if exp_kind else None
             self.engine.add_pattern(kind, tokens, self.label_edit.text())
+            # if expected set, update last added? easier to just set via repo if we have id
+            if exp_kind and exp_val and self.engine._conn is not None:
+                try:
+                    summaries = self.engine.pattern_summaries()
+                    if summaries:
+                        last = summaries[-1]
+                        learn_repo.update_pattern_expected(self.engine._conn, int(last["pattern_id"]), exp_kind, exp_val)
+                        self.engine._reload_model()
+                except Exception:
+                    pass
         except ValueError as exc:
             QMessageBox.warning(self, "Add Pattern", str(exc))
             return
@@ -2805,6 +2885,8 @@ class LearningWidget(QWidget):
             return
         self.tokens_edit.clear()
         self.label_edit.clear()
+        self.expected_kind_combo.setCurrentIndex(0)
+        self._update_expected_options()
         self.refresh()
 
     # ------------------------------------------------------------------
@@ -2874,27 +2956,40 @@ class LearningWidget(QWidget):
                 matches = int(summary.get("matches") or 0)
                 self.patterns_table.setItem(i, 4, make_item(str(length), length))
                 self.patterns_table.setItem(i, 5, make_item(str(matches), matches))
-
+                # hit/miss if expected set
+                hit = int(summary.get("expected_hits") or 0)
+                miss = int(summary.get("expected_misses") or 0)
+                self.patterns_table.setItem(i, 6, make_item(str(hit), hit))
+                self.patterns_table.setItem(i, 7, make_item(str(miss), miss))
+                ek = summary.get("expected_kind")
+                ev = summary.get("expected_value")
+                if ek and ev:
+                    if ek == "movement":
+                        exp_txt = str(ev)
+                    else:
+                        exp_txt = group_labels.get(str(ev), str(ev))
+                else:
+                    exp_txt = "—"
+                self.patterns_table.setItem(i, 8, make_item(exp_txt))
                 next_range = summary.get("best_next_range")
                 self.patterns_table.setItem(
-                    i, 6, make_item(
+                    i, 9, make_item(
                         group_labels.get(str(next_range), str(next_range))
-                        if next_range else "—"))
+                        if next_range not in (None, "", []) else "—"))
                 next_movement = summary.get("best_next_movement")
                 self.patterns_table.setItem(
-                    i, 7, make_item(str(next_movement) if next_movement else "—"))
-
-                accuracy = summary.get("accuracy")
-                self.patterns_table.setItem(
-                    i, 8,
-                    make_item(f"{float(accuracy):.1f}" if accuracy is not None
-                              else "-",
-                              float(accuracy) if accuracy is not None else None))
+                    i, 10, make_item(str(next_movement) if next_movement not in (None, "", []) else "—"))
         finally:
             self.patterns_table.setSortingEnabled(True)
             self._loading_patterns = False
 
-        fit_columns(self.patterns_table)
+        header = self.patterns_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        try:
+            self.patterns_table.resizeColumnsToContents()
+        except Exception:
+            pass
 
         target = selected
         if target is None and summaries:
@@ -2969,10 +3064,16 @@ class LearningWidget(QWidget):
                 table.setItem(
                     i, 4,
                     make_item(f"{float(accuracy):.1f}" if accuracy is not None
-                              else "-",
+                              else "—",
                               float(accuracy) if accuracy is not None else None))
         sort_safely(table, fill)
-        fit_columns(table)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        try:
+            table.resizeColumnsToContents()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Pattern actions
@@ -2988,7 +3089,66 @@ class LearningWidget(QWidget):
         enabled = bool(item and item.checkState() == Qt.Checked)
         self.engine.set_pattern_enabled(pattern_id, not enabled)
 
-    def _on_rename_pattern(self):
+    def _on_set_expected(self):
+        pattern_id = self._selected_pattern_id()
+        if pattern_id is None or not self.engine or self.engine._conn is None:
+            QMessageBox.information(self, "Set Expected", "Select a pattern first.")
+            return
+        # get current
+        current = None
+        for s in self.engine.pattern_summaries():
+            if int(s["pattern_id"]) == pattern_id:
+                current = s
+                break
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Set Expected Outcome")
+        form = QFormLayout(dlg)
+        kind_combo = QComboBox()
+        kind_combo.addItem("Not set", None)
+        kind_combo.addItem("Expect range", "range")
+        kind_combo.addItem("Expect movement", "movement")
+        if current and current.get("expected_kind"):
+            idx = kind_combo.findData(current.get("expected_kind"))
+            if idx >= 0:
+                kind_combo.setCurrentIndex(idx)
+        val_combo = QComboBox()
+        val_combo.setEnabled(kind_combo.currentData() is not None)
+        def _upd():
+            k = kind_combo.currentData()
+            val_combo.clear()
+            if k == "movement":
+                val_combo.setEnabled(True)
+                for mv in ("UP", "DOWN", "FLAT"):
+                    val_combo.addItem(mv, mv)
+            elif k == "range":
+                val_combo.setEnabled(True)
+                try:
+                    groups = config_repo.load_groups(self.engine._conn)
+                    gl = _group_bound_labels(self.engine._conn)
+                    for g in groups:
+                        val_combo.addItem(gl.get(g.group_id, g.name or g.group_id), g.group_id)
+                except Exception:
+                    pass
+            else:
+                val_combo.setEnabled(False)
+            if current and current.get("expected_kind") == k and current.get("expected_value"):
+                vi = val_combo.findData(current.get("expected_value"))
+                if vi >= 0:
+                    val_combo.setCurrentIndex(vi)
+        kind_combo.currentIndexChanged.connect(_upd)
+        _upd()
+        form.addRow("Expected type", kind_combo)
+        form.addRow("Expected value", val_combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec() == QDialog.Accepted:
+            ek = kind_combo.currentData()
+            ev = val_combo.currentData() if ek else None
+            self.engine.update_pattern_expected(pattern_id, ek, ev)
+            self.refresh()
+            self._schedule_rebuild()
         pattern_id = self._selected_pattern_id()
         if pattern_id is None or not self.engine:
             QMessageBox.information(self, "Rename Pattern",

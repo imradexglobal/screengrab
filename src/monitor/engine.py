@@ -953,6 +953,18 @@ class MonitoringEngine(QObject):
             self._reload_model()
         return changed
 
+    def update_pattern_expected(self, pattern_id: int,
+                                expected_kind: Optional[str],
+                                expected_value: Optional[str]) -> bool:
+        if self._conn is None:
+            return False
+        with self._model_lock:
+            changed = learn_repo.update_pattern_expected(
+                self._conn, pattern_id, expected_kind, expected_value)
+        if changed:
+            self._after_pattern_change()
+        return changed
+
     def pattern_summaries(self) -> List[Dict[str, Any]]:
         if self._conn is None:
             return []

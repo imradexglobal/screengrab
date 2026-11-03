@@ -208,7 +208,8 @@ def add_help_label(form: QFormLayout, caption: str, value: QWidget,
 
 def configure_fit_table(table: QTableWidget, min_height: int = 240,
                         stretch: bool = True,
-                        edit_triggers: Optional[int] = None) -> None:
+                        edit_triggers: Optional[int] = None,
+                        interactive: bool = False) -> None:
     """Modern, window-adaptive table baseline.
 
     Columns share the available width (``stretch``), rows alternate in colour,
@@ -218,8 +219,12 @@ def configure_fit_table(table: QTableWidget, min_height: int = 240,
     header.setHighlightSections(False)
     header.setSortIndicatorShown(False)
     header.setMinimumSectionSize(64)
-    header.setSectionResizeMode(
-        QHeaderView.Stretch if stretch else QHeaderView.Interactive)
+    if interactive:
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+    else:
+        header.setSectionResizeMode(
+            QHeaderView.Stretch if stretch else QHeaderView.Interactive)
 
     table.setWordWrap(False)
     table.setAlternatingRowColors(True)

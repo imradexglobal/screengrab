@@ -569,6 +569,8 @@ CREATE TABLE IF NOT EXISTS pattern_definitions (
     tokens TEXT NOT NULL,
     label TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
+    expected_kind TEXT,
+    expected_value TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (kind, tokens)
@@ -673,6 +675,8 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "predictions", "definition_id", "INTEGER")
     _ensure_column(conn, "predictions", "next_movement", "TEXT")
     _ensure_column(conn, "predictions", "next_movement_confidence", "REAL")
+    _ensure_column(conn, "pattern_definitions", "expected_kind", "TEXT")
+    _ensure_column(conn, "pattern_definitions", "expected_value", "TEXT")
 
     # The purge and the safety flags are a one-shot upgrade, not something to
     # repeat on every launch.  ``schema_version`` is written after this function

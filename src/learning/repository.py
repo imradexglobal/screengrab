@@ -298,7 +298,8 @@ def _clean_definition_tokens(conn: sqlite3.Connection, kind: str,
     if kind == KIND_RANGE:
         known = {row["group_id"] for row in conn.execute(
             "SELECT group_id FROM groups")}
-        unknown = [token for token in cleaned if token not in known]
+        unknown = [token for token in cleaned
+                   if token not in known and token != "?"]
         if unknown:
             raise ValueError(
                 "unknown range token(s): " + ", ".join(sorted(set(unknown))))
@@ -310,28 +311,37 @@ def _definition_from_row(row: sqlite3.Row) -> PatternDefinition:
     tokens = tuple(str(row["tokens"] or "").split(","))
     if tokens == ("",):
         tokens = ()
+    expected_kind = row["expected_kind"] if "expected_kind" in row.keys() else None
+    expected_value = row["expected_value"] if "expected_value" in row.keys() else None
     return PatternDefinition(
         pattern_id=int(row["pattern_id"]),
         kind=str(row["kind"]),
         tokens=tokens,
         label=str(row["label"] or ""),
         enabled=bool(row["enabled"]),
+        expected_kind=str(expected_kind) if expected_kind else None,
+        expected_value=str(expected_value) if expected_value else None,
     )
 
 
 def create_pattern_definition(conn: sqlite3.Connection, kind: str,
                               tokens: Sequence[str],
-                              label: str = "") -> int:
+                              label: str = "",
+                              expected_kind: Optional[str] = None,
+                              expected_value: Optional[str] = None) -> int:
     """Add one user-defined pattern and return its id."""
     cleaned = _clean_definition_tokens(conn, kind, tokens)
     now = _now()
     try:
         cursor = conn.execute(
             """INSERT INTO pattern_definitions
-               (kind, tokens, label, enabled, created_at, updated_at)
-               VALUES (?, ?, ?, 1, ?, ?)""",
+               (kind, tokens, label, enabled, expected_kind, expected_value, created_at, updated_at)
+               VALUES (?, ?, ?, 1, ?, ?, ?, ?)""",
             (str(kind).strip().lower(), ",".join(cleaned),
-             str(label or "").strip(), now, now),
+             str(label or "").strip(),
+             str(expected_kind).strip().lower() if expected_kind else None,
+             str(expected_value).strip() if expected_value else None,
+             now, now),
         )
     except sqlite3.IntegrityError as exc:
         raise ValueError("that pattern already exists") from exc
@@ -341,7 +351,7 @@ def create_pattern_definition(conn: sqlite3.Connection, kind: str,
 
 def list_pattern_definitions(conn: sqlite3.Connection) -> List[PatternDefinition]:
     rows = conn.execute(
-        """SELECT pattern_id, kind, tokens, label, enabled
+        """SELECT pattern_id, kind, tokens, label, enabled, expected_kind, expected_value
            FROM pattern_definitions ORDER BY pattern_id ASC"""
     ).fetchall()
     return [_definition_from_row(row) for row in rows]
@@ -349,7 +359,7 @@ def list_pattern_definitions(conn: sqlite3.Connection) -> List[PatternDefinition
 
 def enabled_pattern_definitions(conn: sqlite3.Connection) -> List[PatternDefinition]:
     rows = conn.execute(
-        """SELECT pattern_id, kind, tokens, label, enabled
+        """SELECT pattern_id, kind, tokens, label, enabled, expected_kind, expected_value
            FROM pattern_definitions WHERE enabled = 1 ORDER BY pattern_id ASC"""
     ).fetchall()
     return [_definition_from_row(row) for row in rows]
@@ -358,7 +368,7 @@ def enabled_pattern_definitions(conn: sqlite3.Connection) -> List[PatternDefinit
 def get_pattern_definition(conn: sqlite3.Connection,
                            pattern_id: int) -> Optional[PatternDefinition]:
     row = conn.execute(
-        """SELECT pattern_id, kind, tokens, label, enabled
+        """SELECT pattern_id, kind, tokens, label, enabled, expected_kind, expected_value
            FROM pattern_definitions WHERE pattern_id = ?""",
         (int(pattern_id),),
     ).fetchone()
@@ -376,12 +386,14 @@ def set_pattern_enabled(conn: sqlite3.Connection, pattern_id: int,
     return bool(cursor.rowcount)
 
 
-def update_pattern_label(conn: sqlite3.Connection, pattern_id: int,
-                         label: str) -> bool:
+def update_pattern_expected(conn: sqlite3.Connection, pattern_id: int,
+                            expected_kind: Optional[str],
+                            expected_value: Optional[str]) -> bool:
     cursor = conn.execute(
-        "UPDATE pattern_definitions SET label = ?, updated_at = ? "
-        "WHERE pattern_id = ?",
-        (str(label or "").strip(), _now(), int(pattern_id)),
+        "UPDATE pattern_definitions SET expected_kind = ?, expected_value = ?, updated_at = ? WHERE pattern_id = ?",
+        (str(expected_kind).strip().lower() if expected_kind else None,
+         str(expected_value).strip() if expected_value else None,
+         _now(), int(pattern_id)),
     )
     conn.commit()
     return bool(cursor.rowcount)
@@ -976,7 +988,11 @@ def manual_pattern_summaries(conn: sqlite3.Connection,
             "label": definition.label,
             "enabled": definition.enabled,
             "length": definition.length,
+            "expected_kind": definition.expected_kind,
+            "expected_value": definition.expected_value,
             "matches": matches,
+            "expected_hits": 0,
+            "expected_misses": 0,
             "resolved": resolved,
             "correct": correct,
             "incorrect": incorrect,

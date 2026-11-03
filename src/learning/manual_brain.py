@@ -104,6 +104,8 @@ class PatternDefinition:
     tokens: Tuple[str, ...]
     label: str = ""
     enabled: bool = True
+    expected_kind: Optional[str] = None  # "range" or "movement"
+    expected_value: Optional[str] = None
 
     @property
     def length(self) -> int:
@@ -279,9 +281,15 @@ class ManualBrain:
         for definition in definitions:
             length = definition.length
             if len(sequence) >= length and \
-                    tuple(sequence[-length:]) == definition.tokens:
+                    self._pattern_matches(definition.tokens, tuple(sequence[-length:])):
                 matched.append(definition.pattern_id)
         return matched
+
+    @staticmethod
+    def _pattern_matches(pattern: Sequence[str],
+                         sequence: Sequence[str]) -> bool:
+        """True when ``pattern`` matches ``sequence`` treating ``?`` as wildcard."""
+        return all(p == "?" or p == s for p, s in zip(pattern, sequence))
 
     def _record_cross(self, range_patterns: Iterable[int],
                       movement_patterns: Iterable[int],
