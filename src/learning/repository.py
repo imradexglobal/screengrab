@@ -12,6 +12,8 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from src.config.repository import load_range_config
+from src.config.ranges import RangeConfig
 from src.database.init_db import REGION_B_ID
 from src.learning.manual_brain import (
     KIND_MOVEMENT,
@@ -426,6 +428,8 @@ def _load_stat(engine: LearningEngine, row: sqlite3.Row,
         resolved=row["resolved"],
         correct=row["correct"],
         incorrect=row["incorrect"],
+        expected_hit=row["expected_hit"] if "expected_hit" in row.keys() else 0,
+        expected_miss=row["expected_miss"] if "expected_miss" in row.keys() else 0,
         first_seen=row["first_seen"],
         last_seen=row["last_seen"],
         pattern_kind=row["pattern_kind"],
@@ -937,6 +941,131 @@ def manual_pattern_count(conn: sqlite3.Connection) -> int:
     return int(row["n"] or 0)
 
 
+def _definition_expected_hits(conn: sqlite3.Connection,
+                              model_version: int,
+                              definition_id: int) -> int:
+    """Total expected-outcome hits for one definition."""
+    row = conn.execute(
+        """SELECT COALESCE(SUM(expected_hit), 0) AS n
+           FROM pattern_stats
+           WHERE model_version = ? AND definition_id = ?""",
+        (int(model_version), int(definition_id)),
+    ).fetchone()
+    return int(row["n"] or 0) if row else 0
+
+
+def _definition_expected_misses(conn: sqlite3.Connection,
+                                model_version: int,
+                                definition_id: int) -> int:
+    """Total expected-outcome misses for one definition."""
+    row = conn.execute(
+        """SELECT COALESCE(SUM(expected_miss), 0) AS n
+           FROM pattern_stats
+           WHERE model_version = ? AND definition_id = ?""",
+        (int(model_version), int(definition_id)),
+    ).fetchone()
+    return int(row["n"] or 0) if row else 0
+
+
+def recalculate_expected_hits_for_all_definitions(conn: sqlite3.Connection,
+                                                   model_version: int,
+                                                   range_config: Optional[RangeConfig] = None) -> None:
+    """Scan historical readings and update expected_hit/expected_miss for all pattern definitions.
+
+    This counts how often each user-defined pattern was actually followed by its
+    declared expected outcome in the stored Region A history.  It runs independently
+    of live predictions and gives an immediate historical baseline for Hit/Miss columns.
+    """
+    if range_config is None:
+        range_config = load_range_config(conn)
+
+    definitions = list_pattern_definitions(conn)
+    if not definitions:
+        return
+
+    # Get all Region A readings in chronological order with groups already classified
+    readings = conn.execute(
+        """SELECT reading_id, group_id, numeric_value, capture_timestamp
+           FROM readings
+           WHERE region_id = 'region-A' AND group_id IS NOT NULL
+           ORDER BY reading_id ASC""",
+    ).fetchall()
+
+    if len(readings) < 2:
+        return
+
+    # Pre-compute movements between consecutive readings
+    movements = []
+    for i in range(1, len(readings)):
+        prev_val = readings[i - 1]["numeric_value"]
+        curr_val = readings[i]["numeric_value"]
+        if prev_val is not None and curr_val is not None:
+            movements.append(movement_between(prev_val, curr_val))
+        else:
+            movements.append(None)
+
+    for definition in definitions:
+        if not definition.enabled:
+            continue
+        expected_kind = definition.expected_kind
+        expected_value = definition.expected_value
+        if not expected_kind or not expected_value:
+            continue
+
+        pattern_tokens = list(definition.tokens)
+        pattern_len = len(pattern_tokens)
+        if pattern_len < 1 or pattern_len > len(readings):
+            continue
+
+        hits = 0
+        misses = 0
+
+        # Scan for pattern matches
+        for i in range(len(readings) - pattern_len):
+            window = readings[i:i + pattern_len]
+            if all(w["group_id"] == t for w, t in zip(window, pattern_tokens)):
+                # Pattern matched - check what followed
+                next_idx = i + pattern_len
+                if next_idx >= len(readings):
+                    continue
+
+                next_reading = readings[next_idx]
+                hit = False
+
+                if expected_kind == KIND_RANGE:
+                    hit = (next_reading["group_id"] == expected_value)
+                elif expected_kind == KIND_MOVEMENT:
+                    # Movement index is next_idx - 1 (between last pattern reading and next)
+                    movement_idx = next_idx - 1
+                    if movement_idx < len(movements):
+                        movement = movements[movement_idx]
+                        hit = (movement == expected_value)
+                    else:
+                        continue
+                else:
+                    continue
+
+                if hit:
+                    hits += 1
+                else:
+                    misses += 1
+
+        # Update the primary pattern stat row for this definition
+        # The pattern_sequence is the comma-joined tokens
+        sequence_text = ",".join(pattern_tokens)
+        primary_kind = STAT_RANGE if definition.kind == KIND_RANGE else STAT_MOVEMENT
+
+        conn.execute(
+            """UPDATE pattern_stats
+               SET expected_hit = ?, expected_miss = ?
+               WHERE model_version = ? AND definition_id = ?
+                 AND pattern_sequence = ? AND pattern_kind = ?""",
+            (hits, misses, model_version, definition.pattern_id,
+             sequence_text, primary_kind),
+        )
+    conn.commit()
+
+
 def manual_pattern_summaries(conn: sqlite3.Connection,
                              model_version: int) -> List[Dict]:
     """One summary row per user-defined pattern for the Learning page."""
@@ -991,8 +1120,10 @@ def manual_pattern_summaries(conn: sqlite3.Connection,
             "expected_kind": definition.expected_kind,
             "expected_value": definition.expected_value,
             "matches": matches,
-            "expected_hits": 0,
-            "expected_misses": 0,
+            "expected_hits": _definition_expected_hits(conn, int(model_version),
+                                                      definition.pattern_id),
+            "expected_misses": _definition_expected_misses(conn, int(model_version),
+                                                           definition.pattern_id),
             "resolved": resolved,
             "correct": correct,
             "incorrect": incorrect,

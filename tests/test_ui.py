@@ -96,7 +96,7 @@ def test_learning_widget_recalculate_button(qapp):
     learning = window.learning_page
     assert learning.recalc_btn.text() == "Recalculate App Brain"
     assert learning.recalc_btn.isEnabled() is True
-    assert learning.patterns_table.columnCount() == 9
+    assert learning.patterns_table.columnCount() == 11
     # Patterns are user-defined: the builder and its kind selector exist.
     assert learning.kind_combo.count() == 2
     assert learning.add_pattern_btn.isEnabled() is True

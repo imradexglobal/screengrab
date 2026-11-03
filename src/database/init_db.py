@@ -460,6 +460,8 @@ CREATE TABLE IF NOT EXISTS pattern_stats (
     resolved INTEGER NOT NULL DEFAULT 0,
     correct INTEGER NOT NULL DEFAULT 0,
     incorrect INTEGER NOT NULL DEFAULT 0,
+    expected_hit INTEGER NOT NULL DEFAULT 0,
+    expected_miss INTEGER NOT NULL DEFAULT 0,
     recent_outcomes TEXT NOT NULL DEFAULT '[]',
     first_seen TEXT,
     last_seen TEXT,
@@ -670,6 +672,8 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "pattern_stats", "pattern_kind",
                    "TEXT NOT NULL DEFAULT 'range'")
     _ensure_column(conn, "pattern_stats", "definition_id", "INTEGER")
+    _ensure_column(conn, "pattern_stats", "expected_hit", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "pattern_stats", "expected_miss", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "predictions", "pattern_kind",
                    "TEXT NOT NULL DEFAULT 'range'")
     _ensure_column(conn, "predictions", "definition_id", "INTEGER")

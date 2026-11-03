@@ -2743,6 +2743,11 @@ class LearningWidget(QWidget):
             "Rebuild every outcome and prediction from stored readings.")
         self.recalc_btn.clicked.connect(self._on_recalculate)
         recalc_row.addWidget(self.recalc_btn)
+        self.recalc_expected_btn = make_button(
+            "Recalc Expected Hits", "accent",
+            "Scan historical readings and update Hit/Miss for each pattern's declared expected outcome.")
+        self.recalc_expected_btn.clicked.connect(self._on_recalc_expected_hits)
+        recalc_row.addWidget(self.recalc_expected_btn)
         self.recalc_status_label = QLabel("Idle")
         recalc_row.addWidget(self.recalc_status_label, 1)
         recalc_layout.addLayout(recalc_row)
@@ -3276,6 +3281,26 @@ class LearningWidget(QWidget):
             return
         self._launch_recalc()
 
+    def _on_recalc_expected_hits(self):
+        if not self.engine or self.engine._conn is None:
+            QMessageBox.warning(self, "Recalc Expected Hits",
+                                "The database is not available.")
+            return
+        if self._recalculating:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Recalculate Expected Hits",
+            "Scan all historical Region A readings and update Hit/Miss for each "
+            "pattern's declared expected outcome?\n\n"
+            "This does not rebuild predictions — it only updates the expected_hit "
+            "and expected_miss counters in pattern_stats from history.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        self._launch_recalc_expected_hits()
+
     def _launch_recalc(self):
         if self._recalculating:
             return
@@ -3296,8 +3321,29 @@ class LearningWidget(QWidget):
             result = {"ok": False, "error": str(e)}
         self.recalc_finished.emit(dict(result or {}))
 
+    def _launch_recalc_expected_hits(self):
+        if self._recalculating:
+            return
+        self._recalculating = True
+        self.recalc_btn.setEnabled(False)
+        self.recalc_expected_btn.setEnabled(False)
+        self.add_pattern_btn.setEnabled(False)
+        self.recalc_status_label.setText("Recalculating expected hits...")
+        self.recalc_progress_bar.setValue(0)
+        threading.Thread(target=self._recalc_expected_hits_worker, daemon=True).start()
+
+    def _recalc_expected_hits_worker(self):
+        def report(frac: float, message: str) -> None:
+            self.recalc_progress.emit(float(frac), str(message))
+
+        try:
+            result = self.engine.recalculate_expected_hits(progress=report)
+        except Exception as e:  # noqa: BLE001
+            result = {"ok": False, "error": str(e)}
+        self.recalc_finished.emit(dict(result or {}))
+
     @Slot(float, str)
-    def _on_recalc_progress(self, frac: float, message: str):
+    def _on_recalc_progress(self, frac: float, message: str) -> None:
         self.recalc_progress_bar.setValue(int(max(0.0, min(1.0, frac)) * 100))
         self.recalc_status_label.setText(message)
 

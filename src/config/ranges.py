@@ -228,6 +228,25 @@ def classify_value(config: RangeConfig, value: float) -> Optional[str]:
     return config.classify(value)
 
 
+def range_expected_hit(expected_group_id: Optional[str],
+                       actual_group_id: Optional[str],
+                       config: Optional["RangeConfig"]) -> Optional[bool]:
+    """Whether an actual range satisfied the expected range.
+
+    A hit means the actual group's lower bound is greater than or equal to the
+    expected group's lower bound - i.e. the reading was at least as high as the
+    expected range's floor, even though it may have landed in a higher range.
+    Returns ``None`` when either group is unknown or no expectation was set.
+    """
+    if not expected_group_id or not actual_group_id or config is None:
+        return None
+    expected = config.get(expected_group_id)
+    actual = config.get(actual_group_id)
+    if expected is None or actual is None:
+        return None
+    return to_decimal(actual.lower_bound) >= to_decimal(expected.lower_bound)
+
+
 def validate_groups(groups: Sequence) -> List[str]:
     """Validate a raw sequence of group definitions without constructing a full
     :class:`RangeConfig`."""

@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from src.config.ranges import RangeConfig, range_expected_hit
 from src.learning.patterns import (
     DEFAULT_MAX_SEQUENCE_GAP,
     DEFAULT_RECENT_WINDOW,
@@ -57,7 +58,7 @@ MOVEMENT_FLAT = "FLAT"
 MOVEMENT_TOKENS = (MOVEMENT_UP, MOVEMENT_DOWN, MOVEMENT_FLAT)
 
 #: Pattern length bounds accepted by the UI and the repository.
-MIN_PATTERN_LENGTH = 2
+MIN_PATTERN_LENGTH = 1
 MAX_PATTERN_LENGTH = 12
 
 _COMPARE = Decimal("0.01")
@@ -149,6 +150,7 @@ class ManualBrain:
         definitions: Sequence[PatternDefinition],
         recent_window: int = DEFAULT_RECENT_WINDOW,
         max_sequence_gap: Optional[float] = DEFAULT_MAX_SEQUENCE_GAP,
+        range_config: Optional[RangeConfig] = None,
     ):
         self.definitions: List[PatternDefinition] = list(definitions)
         self._by_id: Dict[int, PatternDefinition] = {
@@ -160,6 +162,7 @@ class ManualBrain:
         self._movement_defs = [
             d for d in self.definitions if d.kind == KIND_MOVEMENT and d.enabled
         ]
+        self.range_config = range_config
 
         self.recent_window = int(recent_window)
         self.max_sequence_gap = max_sequence_gap
@@ -188,6 +191,34 @@ class ManualBrain:
         self.movement_range_counts: Dict[int, Dict[str, int]] = {
             d.pattern_id: {} for d in self._movement_defs
         }
+
+        # Stamp the user-declared expected outcome onto every prediction and
+        # judge it when the outcome arrives.  The pure engine has no access to
+        # the expectation, so the brain provides it.
+        def _expected_provider(definition_id: Optional[int]):
+            if definition_id is None:
+                return None
+            d = self._by_id.get(int(definition_id))
+            if d is None:
+                return None
+            return (d.expected_kind, d.expected_value)
+
+        def _expected_evaluator(prediction: Prediction, actual_group: Optional[str]):
+            if prediction.expected_kind is None:
+                return None
+            if prediction.expected_kind == KIND_MOVEMENT:
+                return (prediction.expected_value == actual_group
+                        if prediction.expected_value is not None
+                        and actual_group is not None else None)
+            if prediction.expected_kind == KIND_RANGE:
+                return range_expected_hit(
+                    prediction.expected_value, actual_group, self.range_config)
+            return None
+
+        self.range_engine.expected_provider = _expected_provider
+        self.range_engine.expected_evaluator = _expected_evaluator
+        self.movement_engine.expected_provider = _expected_provider
+        self.movement_engine.expected_evaluator = _expected_evaluator
 
         self._last_numeric: Optional[float] = None
         self._last_timestamp: Optional[str] = None

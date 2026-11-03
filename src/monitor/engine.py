@@ -1144,6 +1144,39 @@ class MonitoringEngine(QObject):
             self.error_occurred.emit(f"Recalculation failed: {result.get('error')}")
         return result
 
+    def recalculate_expected_hits(self, progress=None) -> Dict[str, Any]:
+        """Scan historical readings and update expected_hit/expected_miss for all patterns.
+
+        This does not rebuild predictions — it only updates the expected_hit and
+        expected_miss counters in pattern_stats from history.
+        """
+        if self._conn is None:
+            return {"ok": False, "error": "database not initialised"}
+
+        self.status_updated.emit("Recalculating expected hits from history...")
+
+        # Get current model version
+        from src.config.repository import get_setting
+        model_version = int(get_setting(self._conn, "model_version", "0"))
+        if model_version == 0:
+            return {"ok": False, "error": "no published model version"}
+
+        # Load range config
+        from src.config.repository import load_range_config
+        config = load_range_config(self._conn)
+
+        # Run the recalculation (it commits its own transaction)
+        if progress:
+            progress(0.1, "Scanning historical readings...")
+        from src.learning import repository as learn_repo
+        learn_repo.recalculate_expected_hits_for_all_definitions(
+            self._conn, model_version, config)
+        if progress:
+            progress(1.0, "Expected hits recalculated")
+
+        self.status_updated.emit("Expected hits recalculated from history")
+        return {"ok": True, "model_version": model_version}
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

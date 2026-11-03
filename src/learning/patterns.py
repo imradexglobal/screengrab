@@ -142,6 +142,8 @@ class PatternStat:
     resolved: int = 0
     correct: int = 0
     incorrect: int = 0
+    expected_hit: int = 0
+    expected_miss: int = 0
     recent: Deque[bool] = field(default_factory=lambda: deque(maxlen=DEFAULT_RECENT_WINDOW))
     first_seen: Optional[str] = None
     last_seen: Optional[str] = None
@@ -172,6 +174,8 @@ class PatternStat:
             "resolved": self.resolved,
             "correct": self.correct,
             "incorrect": self.incorrect,
+            "expected_hit": self.expected_hit,
+            "expected_miss": self.expected_miss,
             "recent_outcomes": [1 if x else 0 for x in self.recent],
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
@@ -205,6 +209,10 @@ class Prediction:
     #: Likely next movement shown alongside a range prediction.
     next_movement: Optional[str] = None
     next_movement_confidence: Optional[float] = None
+    #: The user-declared expected outcome for the definition this prediction
+    #: belongs to (``None`` when no expectation was set).
+    expected_kind: Optional[str] = None
+    expected_value: Optional[str] = None
 
     def as_dict(self) -> Dict:
         return asdict(self)
@@ -263,6 +271,17 @@ class LearningEngine:
         self._last_observed_at: Optional[datetime] = None
         #: Number of times a break was applied, for diagnostics/tests.
         self.sequence_breaks = 0
+        #: Optional ``(prediction, actual_group) -> Optional[bool]`` callback
+        #: invoked when a prediction resolves.  Returns ``True`` for an
+        #: expected-outcome hit, ``False`` for a miss, or ``None`` when the
+        #: outcome cannot be judged.  The engine tallies the result into the
+        #: stat's ``expected_hit`` / ``expected_miss`` counters.
+        self.expected_evaluator: Optional[
+            Callable[["Prediction", Optional[str]], Optional[bool]]] = None
+        #: Optional ``definition_id -> (expected_kind, expected_value)`` lookup
+        #: used to stamp the user-declared expectation onto each prediction.
+        self.expected_provider: Optional[
+            Callable[[Optional[int]], Optional[Tuple[Optional[str], Optional[str]]]]] = None
 
     # ------------------------------------------------------------------
     # Introspection
@@ -388,6 +407,18 @@ class LearningEngine:
                 else:
                     stat.incorrect += 1
                 stat.recent.append(bool(p.is_correct))
+                # Expected-outcome hit/miss is judged by the caller (the
+                # ManualBrain) via ``expected_evaluator``; it has access to the
+                # user-declared expectation, which the pure engine does not.
+                if self.expected_evaluator is not None:
+                    try:
+                        hit = self.expected_evaluator(p, group_id)
+                    except Exception:  # noqa: BLE001 - evaluator must not break learning
+                        hit = None
+                    if hit is True:
+                        stat.expected_hit += 1
+                    elif hit is False:
+                        stat.expected_miss += 1
                 result.updated_stats.append(stat.to_row())
             result.resolved = p
             self._pending = None
@@ -435,6 +466,15 @@ class LearningEngine:
             return None
 
         length, sequence_text, group, stat, total_opp, definition_id = candidate
+        expected_kind = None
+        expected_value = None
+        if self.expected_provider is not None:
+            try:
+                stamped = self.expected_provider(definition_id)
+            except Exception:  # noqa: BLE001 - provider must not break prediction
+                stamped = None
+            if stamped is not None:
+                expected_kind, expected_value = stamped
         prediction = Prediction(
             pattern_length=length,
             pattern_sequence=sequence_text,
@@ -451,6 +491,8 @@ class LearningEngine:
             definition_id=definition_id,
             next_movement=next_movement,
             next_movement_confidence=next_movement_confidence,
+            expected_kind=expected_kind,
+            expected_value=expected_value,
         )
         self._pending = prediction
         return prediction

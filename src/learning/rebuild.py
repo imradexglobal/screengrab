@@ -115,6 +115,7 @@ def recalculate_app_brain(
         brain = ManualBrain(
             definitions,
             recent_window=recent_window,
+            range_config=config,
         )
         predictions = []
         total = max(len(groups), 1)
@@ -134,6 +135,12 @@ def recalculate_app_brain(
 
         report(0.85, f"Replayed {len(groups)} classified readings")
 
+        stat_rows = brain.all_stat_rows()
+
+        # 7) Recalculate expected hits/misses from historical data for all definitions
+        report(0.88, "Recalculating expected hits from history...")
+        learn_repo.recalculate_expected_hits_for_all_definitions(conn, version, config)
+        # Refresh stat_rows with updated expected_hit/expected_miss
         stat_rows = brain.all_stat_rows()
 
         # 5) Validate before publishing anything.
