@@ -313,3 +313,37 @@ class TestBlockedDecisionContract:
         assert conn.execute(
             "SELECT value FROM settings WHERE key='auto_click_enabled'"
         ).fetchone()["value"] == "0"
+
+
+def test_ignore_prediction_conditions_triggers_for_active_pattern_without_stats(temp_db):
+    conn = temp_db
+    configure(conn, confidence_threshold=100, min_evidence=99999, model_stale=1)
+    set_allowed_categories(conn, [])
+    pattern_id = learn_repo.create_pattern_definition(
+        conn, "range", ["g1", "g1", "g1", "g1"], label="Active pattern")
+    engine, dispatcher = make_engine(conn)
+    candidate = prediction(confidence=0, resolved_count=0, recent_accuracy=None,
+                           candidate="not-allowed")
+    candidate["definition_id"] = pattern_id
+
+    decision = engine.try_click(candidate, ignore_prediction_conditions=True)
+
+    assert decision.allowed is True
+    assert len(dispatcher.calls) == 1
+
+
+def test_ignore_prediction_conditions_still_rejects_disabled_pattern(temp_db):
+    conn = temp_db
+    configure(conn)
+    pattern_id = learn_repo.create_pattern_definition(
+        conn, "range", ["g1", "g1", "g1", "g1"], label="Inactive pattern")
+    learn_repo.set_pattern_enabled(conn, pattern_id, False)
+    engine, dispatcher = make_engine(conn)
+    candidate = prediction()
+    candidate["definition_id"] = pattern_id
+
+    decision = engine.try_click(candidate, ignore_prediction_conditions=True)
+
+    assert decision.allowed is False
+    assert decision.code == "CATEGORY_NOT_ENABLED"
+    assert dispatcher.calls == []

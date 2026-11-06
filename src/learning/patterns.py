@@ -314,6 +314,30 @@ class LearningEngine:
     def _sequence_text(self, groups: Iterable[str]) -> str:
         return ",".join(self._abbrev(g) for g in groups)
 
+    def _allowed_definition_for(self, sequence: str) -> Optional[int]:
+        """Return the most-specific allowed definition matching a suffix.
+
+        A question mark in a user-defined sequence matches exactly one observed
+        token. Exact matches win over wildcard matches; among wildcard matches,
+        the pattern with the most literal tokens wins deterministically.
+        """
+        if self.allowed_sequences is None:
+            return None
+        observed = sequence.split(",")
+        matches = []
+        for pattern, definition_id in self.allowed_sequences.items():
+            tokens = pattern.split(",")
+            if len(tokens) != len(observed):
+                continue
+            if all(expected == "?" or expected == actual
+                   for expected, actual in zip(tokens, observed)):
+                specificity = sum(token != "?" for token in tokens)
+                matches.append((specificity, pattern, definition_id))
+        if not matches:
+            return None
+        matches.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return matches[0][2]
+
     def _breaks_sequence(self, now: Optional[str]) -> bool:
         """True when ``now`` is too far after the previous observation.
 
@@ -335,10 +359,11 @@ class LearningEngine:
                   now: Optional[str] = None,
                   definition_id: Optional[int] = None) -> Optional[PatternStat]:
         if self.allowed_sequences is not None:
-            if sequence not in self.allowed_sequences:
+            matched_definition = self._allowed_definition_for(sequence)
+            if matched_definition is None:
                 return None
             if definition_id is None:
-                definition_id = self.allowed_sequences[sequence]
+                definition_id = matched_definition
         key = (length, sequence, candidate)
         stat = self._stats.get(key)
         if stat is None:
@@ -434,7 +459,7 @@ class LearningEngine:
                 pattern_groups = self.sequence[prev_idx - length + 1: prev_idx + 1]
                 sequence_text = self._sequence_text(pattern_groups)
                 if (self.allowed_sequences is not None
-                        and sequence_text not in self.allowed_sequences):
+                        and self._allowed_definition_for(sequence_text) is None):
                     continue
                 stat = self._get_stat(length, sequence_text, group_id, now)
                 if stat is None:
@@ -515,7 +540,7 @@ class LearningEngine:
             pattern_groups = self.sequence[n - length: n]
             sequence_text = self._sequence_text(pattern_groups)
             if (self.allowed_sequences is not None
-                    and sequence_text not in self.allowed_sequences):
+                    and self._allowed_definition_for(sequence_text) is None):
                 continue
 
             # gather all candidates recorded for this pattern
@@ -546,7 +571,7 @@ class LearningEngine:
 
             definition_id = best.definition_id
             if definition_id is None and self.allowed_sequences is not None:
-                definition_id = self.allowed_sequences.get(sequence_text)
+                definition_id = self._allowed_definition_for(sequence_text)
 
             ranked.append(
                 (support, total_opportunities, length, self._ordinal(best.candidate_group),

@@ -804,6 +804,43 @@ class MonitoringEngine(QObject):
                 "confidence": p.confidence,
             })
 
+        ignore_click_conditions = get_setting_bool(
+            self._conn, "ignore_click_conditions", False)
+        if ignore_click_conditions:
+            matched_ids = (list(self._learner._pending_range_patterns) +
+                            list(self._learner._pending_movement_patterns))
+            active_matches = [learn_repo.get_pattern_definition(self._conn, pid)
+                              for pid in matched_ids]
+            active_matches = [d for d in active_matches if d is not None and d.enabled]
+            if active_matches:
+                definition = active_matches[0]
+                prediction = {
+                    "prediction_id": None, "candidate_group": group_id,
+                    "confidence": 0.0, "resolved_count": 0,
+                    "correct_count": 0, "recent_accuracy": None,
+                    "pattern_length": definition.length,
+                    "pattern_sequence": definition.sequence_text,
+                    "pattern_kind": definition.kind,
+                    "definition_id": definition.pattern_id,
+                    "next_movement": None, "next_movement_confidence": None,
+                    "active_pattern_match": True,
+                }
+                self.prediction_made.emit(prediction)
+                decision = self._auto_click.try_click(
+                    prediction, ignore_prediction_conditions=True) if self._auto_click else None
+                if decision is not None:
+                    if decision.allowed:
+                        self._counters["clicks_dispatched"] += 1
+                    else:
+                        self._counters["clicks_blocked"] += 1
+                    self.click_event.emit({
+                        "allowed": decision.allowed, "outcome": decision.outcome,
+                        "code": decision.code, "message": decision.message,
+                        "region_a_count": decision.region_a_count,
+                        "prediction": prediction,
+                    })
+                return
+
         if new_prediction_id is None or result.prediction is None:
             return
 
@@ -826,7 +863,8 @@ class MonitoringEngine(QObject):
         self.prediction_made.emit(prediction)
 
         if self._auto_click is not None:
-            decision: ClickDecision = self._auto_click.try_click(prediction)
+            decision: ClickDecision = self._auto_click.try_click(
+                prediction, ignore_prediction_conditions=ignore_click_conditions)
             if decision.allowed:
                 self._counters["clicks_dispatched"] += 1
             else:
@@ -1000,6 +1038,19 @@ class MonitoringEngine(QObject):
                 "killed": False, "model_stale": True, "rebuilding": False,
             }
         return self._auto_click.gate_status()
+
+    def test_click_sequence(self) -> Optional[ClickDecision]:
+        """Manually test the configured workflow without a pattern match."""
+        if self._auto_click is None:
+            return None
+        decision = self._auto_click.test_sequence()
+        self.click_event.emit({
+            "allowed": decision.allowed, "outcome": decision.outcome,
+            "code": decision.code, "message": decision.message,
+            "region_a_count": decision.region_a_count,
+            "prediction": {"manual_test": True},
+        })
+        return decision
 
     def kill_switch(self) -> None:
         if self._auto_click is not None:

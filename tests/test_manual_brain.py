@@ -129,6 +129,29 @@ class TestRangePattern:
         assert brain.all_stat_rows() == []
 
 
+class TestWildcardRangePattern:
+    def test_question_marks_match_any_range_and_learn_the_suffix(self):
+        definition = PatternDefinition(9, KIND_RANGE,
+                                      ("g1", "g2", "?", "?", "?"))
+        brain = ManualBrain([definition])
+        groups = ["g1", "g2", "g3", "g1", "g2"]
+        values = [1.0, 2.0, 3.0, 1.0, 2.0]
+        _observe(brain, groups, values)
+
+        assert 9 in brain._pending_range_patterns
+        brain.observe("g3", 3.0, now=(_BASE + timedelta(seconds=5)).isoformat())
+        rows = brain.range_engine.stats.values()
+        assert any(row.definition_id == 9 for row in rows)
+
+    def test_question_mark_pattern_rejects_nonmatching_literal_prefix(self):
+        definition = PatternDefinition(9, KIND_RANGE,
+                                      ("g1", "g2", "?", "?", "?"))
+        brain = ManualBrain([definition])
+        _observe(brain, ["g2", "g2", "g3", "g1", "g2"],
+                 [2.0, 2.0, 3.0, 1.0, 2.0])
+        assert 9 not in brain._pending_range_patterns
+
+
 class TestMovementPattern:
     def test_learns_next_movement_and_next_range(self):
         definition = PatternDefinition(1, KIND_MOVEMENT, ("UP", "DOWN"))

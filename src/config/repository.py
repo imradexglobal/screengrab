@@ -70,6 +70,53 @@ def set_allowed_categories(conn: sqlite3.Connection, group_ids: List[str]) -> No
     set_setting(conn, "allowed_categories", json.dumps(sorted(set(group_ids))))
 
 
+def get_click_workflow(conn: sqlite3.Connection) -> List[Dict]:
+    """Load ordered click and amount actions; legacy targets become click steps."""
+    import json
+    raw = get_setting(conn, "click_workflow", "[]")
+    try:
+        rows = json.loads(raw)
+        if isinstance(rows, list) and rows:
+            return [x for x in rows if isinstance(x, dict) and x.get("type") in ("click", "amount")]
+    except (TypeError, ValueError):
+        pass
+    return [{"type": "click", "target": t} for t in get_click_targets(conn)]
+
+
+def set_click_workflow(conn: sqlite3.Connection, steps: List[Dict]) -> None:
+    import json
+    cleaned = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if step.get("type") == "click" and isinstance(step.get("target"), dict):
+            t = step["target"]
+            if "x" in t and "y" in t:
+                cleaned.append({"type": "click", "target": {**t, "x": int(t["x"]), "y": int(t["y"])}})
+        elif step.get("type") == "amount":
+            mode = "auto" if step.get("mode") == "auto" else "fixed"
+            try:
+                value = max(0.0, float(step.get("value", 0)))
+            except (TypeError, ValueError):
+                value = 0.0
+            cleaned.append({"type": "amount", "mode": mode, "value": value})
+    set_setting(conn, "click_workflow", json.dumps(cleaned))
+
+
+def get_amount_keypad(conn: sqlite3.Connection) -> Dict:
+    import json
+    try:
+        data = json.loads(get_setting(conn, "amount_keypad", "{}"))
+        return data if isinstance(data, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def set_amount_keypad(conn: sqlite3.Connection, keys: Dict) -> None:
+    import json
+    set_setting(conn, "amount_keypad", json.dumps(keys))
+
+
 def get_click_target(conn: sqlite3.Connection) -> Dict:
     raw = get_setting(conn, "click_target", "{}")
     try:

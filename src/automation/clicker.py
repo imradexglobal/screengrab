@@ -27,6 +27,8 @@ from typing import Callable, Dict, List, Optional
 from src.config.repository import (
     get_allowed_categories,
     get_click_targets,
+    get_click_workflow,
+    get_amount_keypad,
     get_click_sequence_delay_ms,
     get_setting,
     get_setting_bool,
@@ -52,6 +54,7 @@ BLOCK_CODES = (
     "INSUFFICIENT_EVIDENCE",
     "RECENT_ACCURACY_TOO_LOW",
     "INVALID_TARGET_COORDINATES",
+    "AMOUNT_SOURCE_UNAVAILABLE",
     "DISPLAY_CALIBRATION_CHANGED",
     "TARGET_WINDOW_NOT_VERIFIED",
     "DUPLICATE_ACTION",
@@ -69,6 +72,7 @@ BLOCK_EXPLANATIONS: Dict[str, str] = {
     "INSUFFICIENT_EVIDENCE": "There are not enough resolved predictions for this pattern.",
     "RECENT_ACCURACY_TOO_LOW": "Recent performance is below the configured safeguard.",
     "INVALID_TARGET_COORDINATES": "The click target has not been calibrated.",
+    "AMOUNT_SOURCE_UNAVAILABLE": "Auto amount needs a valid saved Region B reading.",
     "DISPLAY_CALIBRATION_CHANGED": "The display layout changed since calibration.",
     "TARGET_WINDOW_NOT_VERIFIED": "The intended target window could not be verified.",
     "DUPLICATE_ACTION": "A click was already dispatched for this prediction.",
@@ -234,7 +238,8 @@ class AutoClickEngine:
         return self._killed
 
     # -- main entry point ---------------------------------------------
-    def try_click(self, prediction: Dict, dry_run: Optional[bool] = None) -> ClickDecision:
+    def try_click(self, prediction: Dict, dry_run: Optional[bool] = None,
+                  ignore_prediction_conditions: bool = False) -> ClickDecision:
         """Evaluate all conditions for one prediction and dispatch if allowed.
 
         ``prediction`` must carry: ``prediction_id``, ``candidate_group``,
@@ -274,46 +279,74 @@ class AutoClickEngine:
         # 3/4) Model validity and recalculation state
         if get_setting_bool(conn, "rebuild_in_progress", False):
             return blocked("REBUILD_IN_PROGRESS")
-        if get_setting(conn, "model_stale", "1") == "1":
+        if (get_setting(conn, "model_stale", "1") == "1"
+                and not ignore_prediction_conditions):
             return blocked("MODEL_RECALCULATION_REQUIRED")
 
-        # 5) Predicted category selected
-        allowed = set(get_allowed_categories(conn))
-        candidate = prediction.get("candidate_group")
-        if candidate not in allowed:
-            return blocked("CATEGORY_NOT_ENABLED", f"category '{candidate}' is not enabled")
+        definition_id = prediction.get("definition_id")
+        if definition_id is not None:
+            from src.learning import repository as learn_repo
+            definition = learn_repo.get_pattern_definition(conn, int(definition_id))
+            if definition is None or not definition.enabled:
+                return blocked("CATEGORY_NOT_ENABLED", "matched pattern is not active")
 
-        # 6) Confidence strictly greater than the threshold
-        threshold = get_setting_float(conn, "confidence_threshold", 70.0)
-        confidence = float(prediction.get("confidence") or 0.0)
-        if not confidence > threshold:
-            return blocked("CONFIDENCE_TOO_LOW",
-                           f"confidence {confidence:.2f}% is not > {threshold:.2f}%")
+        # 5–8) Prediction-quality conditions can be ignored only for an
+        # active user-defined pattern match. Master enable, stale-model state,
+        # the hard record gate and dispatch safeguards remain enforced.
+        if ignore_prediction_conditions:
+            definition_id = prediction.get("definition_id")
+            if definition_id is None:
+                return blocked("CATEGORY_NOT_ENABLED", "no active pattern definition matched")
+            from src.learning import repository as learn_repo
+            definition = learn_repo.get_pattern_definition(conn, int(definition_id))
+            if definition is None or not definition.enabled:
+                return blocked("CATEGORY_NOT_ENABLED", "matched pattern is not active")
+        else:
+            allowed = set(get_allowed_categories(conn))
+            candidate = prediction.get("candidate_group")
+            if candidate not in allowed:
+                return blocked("CATEGORY_NOT_ENABLED", f"category '{candidate}' is not enabled")
 
-        # 7) Minimum evidence
-        min_evidence = get_setting_int(conn, "min_evidence", 30)
-        resolved_count = int(prediction.get("resolved_count") or 0)
-        if resolved_count < min_evidence:
-            return blocked("INSUFFICIENT_EVIDENCE",
-                           f"{resolved_count} resolved predictions < {min_evidence} required")
+            threshold = get_setting_float(conn, "confidence_threshold", 70.0)
+            confidence = float(prediction.get("confidence") or 0.0)
+            if not confidence > threshold:
+                return blocked("CONFIDENCE_TOO_LOW",
+                               f"confidence {confidence:.2f}% is not > {threshold:.2f}%")
 
-        # 8) Recent-performance safeguard
-        if get_setting_bool(conn, "recent_safeguard_enabled", True):
-            recent = prediction.get("recent_accuracy")
-            recent_min = get_setting_float(conn, "recent_min_accuracy", 60.0)
-            if recent is None or float(recent) < recent_min:
-                return blocked(
-                    "RECENT_ACCURACY_TOO_LOW",
-                    f"recent accuracy {recent if recent is not None else 'n/a'} < {recent_min:.2f}%",
-                )
+            min_evidence = get_setting_int(conn, "min_evidence", 30)
+            resolved_count = int(prediction.get("resolved_count") or 0)
+            if resolved_count < min_evidence:
+                return blocked("INSUFFICIENT_EVIDENCE",
+                               f"{resolved_count} resolved predictions < {min_evidence} required")
+
+            if get_setting_bool(conn, "recent_safeguard_enabled", True):
+                recent = prediction.get("recent_accuracy")
+                recent_min = get_setting_float(conn, "recent_min_accuracy", 60.0)
+                if recent is None or float(recent) < recent_min:
+                    return blocked(
+                        "RECENT_ACCURACY_TOO_LOW",
+                        f"recent accuracy {recent if recent is not None else 'n/a'} < {recent_min:.2f}%",
+                    )
 
         # 9/10) Click points and display calibration
         # Every configured point must exist and still sit on the display layout
         # it was calibrated against; the whole sequence is refused if any point
         # drifted, so a partially stale sequence never runs.
-        targets = get_click_targets(conn)
+        workflow = get_click_workflow(conn)
+        targets = [s["target"] for s in workflow if s.get("type") == "click"]
         if not targets:
-            return blocked("INVALID_TARGET_COORDINATES", "no calibrated target")
+            return blocked("INVALID_TARGET_COORDINATES", "no calibrated click target")
+        keypad = get_amount_keypad(conn)
+        amount_steps = [s for s in workflow if s.get("type") == "amount"]
+        if amount_steps:
+            if any(s.get("mode") == "auto" for s in amount_steps):
+                from src.learning.repository import last_region_b_reading
+                if last_region_b_reading(conn) is None:
+                    return blocked("AMOUNT_SOURCE_UNAVAILABLE", "automatic amount requires a saved Region B reading")
+            required_keys = set("0123456789") | {".", "clear", "done"}
+            if not required_keys.issubset(keypad):
+                return blocked("INVALID_TARGET_COORDINATES", "amount keypad is not fully calibrated")
+            targets += [keypad[k] for k in required_keys]
         for index, target in enumerate(targets, start=1):
             tx_i, ty_i = int(target["x"]), int(target["y"])
             current_sig = capture_display_signature(tx_i, ty_i)
@@ -362,19 +395,18 @@ class AutoClickEngine:
             allowed=True, code="OK", region_a_count=region_a_count,
             prediction_id=prediction_id, target_x=tx, target_y=ty,
         )
-        point_summary = ", ".join(f"({int(t['x'])}, {int(t['y'])})"
-                                  for t in targets)
+        point_summary = ", ".join(f"({int(t['x'])}, {int(t['y'])})" for t in targets)
         if dry_run:
             decision.outcome = "DRY_RUN"
             decision.detail = (
-                f"dry run: would click {len(targets)} point(s): {point_summary}"
+                f"dry run: would run {len(workflow)} workflow step(s); points: {point_summary}"
             )
             self._audit(decision, dry_run=True)
             return decision
 
         delay_ms = get_click_sequence_delay_ms(conn)
         try:
-            ok, dispatch_detail = self._dispatch_sequence(targets, delay_ms)
+            ok, dispatch_detail = self._dispatch_workflow(workflow, keypad, prediction, delay_ms)
         except Exception as exc:  # pragma: no cover - platform dependent
             decision.outcome = "UNKNOWN"
             decision.detail = f"dispatch raised: {exc}"
@@ -391,6 +423,65 @@ class AutoClickEngine:
             conn.commit()
         self._audit(decision, dry_run=False)
         return decision
+
+    def test_sequence(self) -> ClickDecision:
+        """Immediately dispatch the saved sequence, bypassing all automation gates.
+
+        This explicit manual test entry point intentionally ignores dry-run,
+        kill-switch, record-count, pattern, eligibility, calibration-drift, and
+        target-window gates. Only configured actions can be dispatched.
+        """
+        workflow = get_click_workflow(self._conn)
+        keypad = get_amount_keypad(self._conn)
+        decision = ClickDecision(
+            allowed=True, code="MANUAL_TEST", region_a_count=count_valid_region_a_readings(self._conn))
+        if not workflow:
+            decision.allowed = False
+            decision.code = "INVALID_TARGET_COORDINATES"
+            decision.detail = "manual test: no saved click sequence"
+            self._audit(decision, dry_run=False)
+            return decision
+        try:
+            ok, detail = self._dispatch_workflow(
+                workflow, keypad, {}, get_click_sequence_delay_ms(self._conn))
+            decision.outcome = "DISPATCHED" if ok else "FAILED"
+            decision.detail = "manual live test: " + (detail or "sequence complete")
+        except Exception as exc:
+            decision.outcome = "FAILED"
+            decision.detail = f"manual live test failed: {exc}"
+        self._audit(decision, dry_run=False)
+        return decision
+
+    def _dispatch_workflow(self, workflow: List[Dict], keypad: Dict,
+                           prediction: Dict, delay_ms: int) -> tuple:
+        """Execute click points and keypad-entry actions in their configured order."""
+        if not workflow:
+            return False, "empty workflow"
+        last_b = None
+        amount_steps = [s for s in workflow if s.get("type") == "amount"]
+        if amount_steps and any(s.get("mode") == "auto" for s in amount_steps):
+            from src.learning.repository import last_region_b_reading
+            row = last_region_b_reading(self._conn)
+            if row is None:
+                return False, "automatic amount unavailable: no Region B reading"
+            from decimal import Decimal
+            last_b = max(Decimal("0"), Decimal(str(row["numeric_value"])) * Decimal("0.10"))
+        events = []
+        for step in workflow:
+            if step.get("type") == "click":
+                events.append(step["target"])
+            elif step.get("type") == "amount":
+                from decimal import Decimal
+                amount = last_b if step.get("mode") == "auto" else Decimal(str(max(0.0, float(step.get("value", 0)))))
+                amount_text = format(amount, "f")
+                if "." in amount_text:
+                    amount_text = amount_text.rstrip("0").rstrip(".")
+                events.append(keypad["clear"])
+                events.extend(keypad[d] for d in amount_text)
+                events.append(keypad["done"])
+        if not events:
+            return False, "workflow has no executable actions"
+        return self._dispatch_sequence(events, delay_ms)
 
     def _dispatch_sequence(self, targets: List[Dict], delay_ms: int) -> tuple:
         """Click every configured point in order, ``delay_ms`` apart.

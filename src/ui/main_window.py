@@ -654,6 +654,7 @@ class ClickSpotOverlay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._points: List[tuple] = []   # list of (logical_x, logical_y)
+        self._markers_visible = True
         self._affinity_applied = False
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -690,7 +691,19 @@ class ClickSpotOverlay(QWidget):
             geo = self.geometry()
             logical.append((lx - geo.x(), ly - geo.y()))
         self._points = logical
-        if logical:
+        if logical and self._markers_visible:
+            if not self.isVisible():
+                self.show()
+                self._apply_capture_exclusion()
+            self.raise_()
+        else:
+            self.hide()
+        self.update()
+
+    def set_markers_visible(self, visible: bool) -> None:
+        """Show or hide all calibrated markers without discarding their points."""
+        self._markers_visible = bool(visible)
+        if self._markers_visible and self._points:
             if not self.isVisible():
                 self.show()
                 self._apply_capture_exclusion()
@@ -2606,19 +2619,21 @@ class LearningWidget(QWidget):
         self.up_token_btn = make_button("UP", "quiet")
         self.down_token_btn = make_button("DOWN", "quiet")
         self.flat_token_btn = make_button("FLAT", "quiet")
+        self.question_token_btn = make_button("?", "quiet")
         self.up_token_btn.clicked.connect(lambda: self._add_token("UP"))
         self.down_token_btn.clicked.connect(lambda: self._add_token("DOWN"))
         self.flat_token_btn.clicked.connect(lambda: self._add_token("FLAT"))
+        self.question_token_btn.clicked.connect(lambda: self._add_token("?"))
         token_buttons_row.addWidget(self.up_token_btn)
         token_buttons_row.addWidget(self.down_token_btn)
         token_buttons_row.addWidget(self.flat_token_btn)
+        token_buttons_row.addWidget(self.question_token_btn)
         token_buttons_row.addStretch(1)
         self.token_range_container = QWidget()
         token_range_layout = QHBoxLayout(self.token_range_container)
         token_range_layout.setContentsMargins(0, 0, 0, 0)
         token_range_layout.setSpacing(4)
         self.token_range_buttons = []
-        token_range_layout.addStretch(1)
         self.token_range_container.setVisible(False)
         add_help_row(builder_layout, "Add tokens", token_buttons_row,
                      "Click to append tokens to the pattern.")
@@ -2799,6 +2814,7 @@ class LearningWidget(QWidget):
         else:
             self.expected_value_combo.setEnabled(False)
         kind = self.kind_combo.currentData()
+        self._refresh_token_range_buttons()
         if kind == "movement":
             self.tokens_edit.setPlaceholderText("e.g. UP, DOWN, UP, DOWN")
             self.builder_hint.setText(
@@ -2852,6 +2868,12 @@ class LearningWidget(QWidget):
         except Exception:  # noqa: BLE001
             return
         layout = self.token_range_container.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.token_range_buttons = []
         for g in groups:
             label = group_labels.get(g.group_id, g.name or g.group_id)
             btn = make_button(label, "quiet")
@@ -3524,6 +3546,13 @@ class AutomationWidget(QWidget):
                      self.min_evidence_spin,
                      "How many predictions must be resolved before clicking starts.")
 
+        self.ignore_click_conditions_check = QCheckBox(
+            "Trigger on active pattern match (ignore prediction statistics)")
+        self.ignore_click_conditions_check.setToolTip(
+            "A match from an active pattern can trigger without outcome statistics. "
+            "The master enable, mandatory Region A record gate, and dispatch safeguards remain active.")
+        conditions_layout.addRow("", self.ignore_click_conditions_check)
+
         self.recent_safeguard_check = QCheckBox("Enable recent-accuracy safeguard")
         conditions_layout.addRow("", self.recent_safeguard_check)
 
@@ -3569,16 +3598,23 @@ class AutomationWidget(QWidget):
             "position is clicked in order, waiting the configured gap between "
             "clicks. Positions are physical pixels on the target monitor.")
         target_layout.addWidget(target_hint)
+        self.show_click_positions_check = QCheckBox("Show all click positions on screen")
+        self.show_click_positions_check.setChecked(True)
+        self.show_click_positions_check.setToolTip(
+            "Toggle the numbered on-screen markers for configured click locations. "
+            "This does not change the saved click sequence.")
+        self.show_click_positions_check.toggled.connect(self._set_click_positions_visible)
+        target_layout.addWidget(self.show_click_positions_check)
 
         points_row = QHBoxLayout()
         points_row.setSpacing(8)
 
         self.targets_table = PlaceholderTable(
-            0, 3,
+            0, 2,
             "No click points yet - use Pick on Screen or Use Cursor Position "
             "to define where automation clicks.")
         self.targets_table.setHorizontalHeaderLabels(
-            ["#", "X (physical px)", "Y (physical px)"])
+            ["#", "Selected screen point (physical px)"])
         configure_fit_table(self.targets_table, min_height=160)
         self.targets_table.horizontalHeader().setStretchLastSection(False)
         points_row.addWidget(self.targets_table, 2)
@@ -3594,11 +3630,6 @@ class AutomationWidget(QWidget):
                                       "Add the point currently under the mouse.")
         self.cursor_btn.clicked.connect(self._use_cursor_position)
         point_buttons.addWidget(self.cursor_btn)
-
-        self.add_target_btn = make_button("Add Point", "quiet",
-                                          "Append a new point with typed coordinates.")
-        self.add_target_btn.clicked.connect(self._add_point_row)
-        point_buttons.addWidget(self.add_target_btn)
 
         self.remove_target_btn = make_button("Remove Selected", "danger",
                                              "Delete the selected points from the sequence.")
@@ -3627,6 +3658,42 @@ class AutomationWidget(QWidget):
         delay_row.addStretch(1)
         target_layout.addLayout(delay_row)
 
+        amount_row = QHBoxLayout()
+        self.amount_position_spin = QSpinBox()
+        self.amount_position_spin.setRange(0, 100)
+        self.amount_position_spin.setToolTip(
+            "Insert after this many click-location steps (0 = before the first click).")
+        self.amount_mode_combo = QComboBox()
+        self.amount_mode_combo.addItems(["Auto (10% of latest Range B)", "Fixed value"])
+        self.amount_value_spin = QDoubleSpinBox()
+        self.amount_value_spin.setRange(0.0, 999999999.0)
+        self.amount_value_spin.setDecimals(6)
+        self.amount_value_spin.setSingleStep(0.01)
+        self.amount_value_spin.setEnabled(False)
+        self.amount_mode_combo.currentIndexChanged.connect(
+            lambda i: self.amount_value_spin.setEnabled(i == 1))
+        self.amount_new_btn = make_button("New Amount Step", "quiet")
+        self.amount_new_btn.clicked.connect(self._new_amount_step)
+        self.amount_add_btn = make_button("Add / Update Selected", "accent")
+        self.amount_add_btn.clicked.connect(self._add_amount_step)
+        self.amount_remove_btn = make_button("Remove Selected", "danger")
+        self.amount_remove_btn.clicked.connect(self._remove_selected_amount_step)
+        amount_row.addWidget(QLabel("Insert after click locations:"))
+        amount_row.addWidget(self.amount_position_spin)
+        amount_row.addWidget(self.amount_mode_combo)
+        amount_row.addWidget(self.amount_value_spin)
+        amount_row.addWidget(self.amount_new_btn)
+        amount_row.addWidget(self.amount_add_btn)
+        amount_row.addWidget(self.amount_remove_btn)
+        target_layout.addLayout(amount_row)
+        target_layout.addWidget(QLabel("Saved amount steps (select a row to edit):"))
+        self.amount_steps_list = QListWidget()
+        self.amount_steps_list.setMinimumHeight(90)
+        self.amount_steps_list.currentRowChanged.connect(self._select_amount_step)
+        target_layout.addWidget(self.amount_steps_list)
+        self._amount_steps = []
+        self._load_amount_steps()
+
         self.calibration_label = QLabel("Not calibrated")
         self.calibration_label.setWordWrap(True)
         target_layout.addWidget(self.calibration_label)
@@ -3639,6 +3706,12 @@ class AutomationWidget(QWidget):
                                     "Persist every setting on this page.")
         self.save_btn.clicked.connect(self._save_settings)
         buttons.addWidget(self.save_btn)
+
+        self.test_sequence_btn = make_button(
+            "Test Click Sequence Now (LIVE)", "accent",
+            "Immediately run the saved workflow without waiting for a pattern or condition.")
+        self.test_sequence_btn.clicked.connect(self._test_click_sequence)
+        buttons.addWidget(self.test_sequence_btn)
 
         self.kill_btn = make_button("Kill Switch (halt automation now)", "danger",
                                     "Stop automated clicking immediately.")
@@ -3663,6 +3736,8 @@ class AutomationWidget(QWidget):
             config_repo.get_setting_float(conn, "confidence_threshold", 70.0))
         self.min_evidence_spin.setValue(
             config_repo.get_setting_int(conn, "min_evidence", 30))
+        self.ignore_click_conditions_check.setChecked(
+            config_repo.get_setting_bool(conn, "ignore_click_conditions", False))
         self.recent_safeguard_check.setChecked(
             config_repo.get_setting_bool(conn, "recent_safeguard_enabled", True))
         self.recent_window_spin.setValue(
@@ -3671,9 +3746,23 @@ class AutomationWidget(QWidget):
             config_repo.get_setting_float(conn, "recent_min_accuracy", 60.0))
         self.cooldown_spin.setValue(
             config_repo.get_setting_int(conn, "cooldown_seconds", 5))
+        markers_visible = config_repo.get_setting_bool(
+            conn, "click_positions_visible", True)
+        self.show_click_positions_check.blockSignals(True)
+        self.show_click_positions_check.setChecked(markers_visible)
+        self.show_click_positions_check.blockSignals(False)
+        self._click_spot_overlay.set_markers_visible(markers_visible)
 
         self._load_categories()
         self._load_target()
+        self._load_amount_steps()
+
+    def _set_click_positions_visible(self, visible: bool):
+        self._click_spot_overlay.set_markers_visible(visible)
+        if self.engine and self.engine._conn is not None:
+            config_repo.set_setting(
+                self.engine._conn, "click_positions_visible", "1" if visible else "0")
+            self.engine._conn.commit()
 
     def _load_categories(self):
         conn = self.engine._conn
@@ -3689,6 +3778,74 @@ class AutomationWidget(QWidget):
             item.setCheckState(Qt.Checked if g.group_id in allowed else Qt.Unchecked)
             item.setData(Qt.UserRole, g.group_id)
             self.categories_list.addItem(item)
+
+    def _load_amount_steps(self):
+        import json
+        try:
+            raw = config_repo.get_setting(self.engine._conn, "click_amount_actions", "[]")
+            data = json.loads(raw)
+            self._amount_steps = data if isinstance(data, list) else []
+        except Exception:
+            self._amount_steps = []
+        self._refresh_amount_steps_list()
+
+    def _refresh_amount_steps_list(self):
+        selected = self.amount_steps_list.currentRow()
+        self.amount_steps_list.blockSignals(True)
+        self.amount_steps_list.clear()
+        for i, action in enumerate(self._amount_steps, 1):
+            mode = ("Auto (10% of latest Range B)" if action.get("mode") == "auto"
+                    else f"Fixed {action.get('value', 0)}")
+            self.amount_steps_list.addItem(
+                f"{i}. After {int(action.get('after', 0))} click(s) — {mode}")
+        if self._amount_steps:
+            self.amount_steps_list.setCurrentRow(
+                min(max(selected, 0), len(self._amount_steps) - 1))
+        self.amount_steps_list.blockSignals(False)
+
+    def _select_amount_step(self, row):
+        if row < 0 or row >= len(self._amount_steps):
+            return
+        action = self._amount_steps[row]
+        self.amount_position_spin.setValue(int(action.get("after", 0)))
+        self.amount_mode_combo.setCurrentIndex(0 if action.get("mode") == "auto" else 1)
+        self.amount_value_spin.setValue(float(action.get("value", 0)))
+
+    def _new_amount_step(self):
+        self.amount_steps_list.setCurrentRow(-1)
+        self.amount_position_spin.setValue(0)
+        self.amount_mode_combo.setCurrentIndex(0)
+        self.amount_value_spin.setValue(0.0)
+
+    def _add_amount_step(self):
+        row = self.amount_steps_list.currentRow()
+        action = {"after": int(self.amount_position_spin.value()),
+                  "mode": "auto" if self.amount_mode_combo.currentIndex() == 0 else "fixed",
+                  "value": float(self.amount_value_spin.value())}
+        if 0 <= row < len(self._amount_steps):
+            self._amount_steps[row] = action
+        else:
+            self._amount_steps.append(action)
+        self._amount_steps.sort(key=lambda item: int(item.get("after", 0)))
+        self._refresh_amount_steps_list()
+
+    def _remove_selected_amount_step(self):
+        row = self.amount_steps_list.currentRow()
+        if 0 <= row < len(self._amount_steps):
+            del self._amount_steps[row]
+            self._refresh_amount_steps_list()
+
+    def _test_click_sequence(self):
+        if not self.engine:
+            return
+        decision = self.engine.test_click_sequence()
+        if decision is None:
+            QMessageBox.warning(self, "Test Click Sequence", "Automation engine is not ready.")
+        elif decision.outcome == "DISPATCHED":
+            QMessageBox.information(self, "Test Sequence Result", decision.message)
+        else:
+            QMessageBox.warning(self, "Test Sequence Result", decision.message)
+        self.refresh_status()
 
     def _load_target(self):
         """Fill the point sequence from the stored click targets."""
@@ -3725,20 +3882,9 @@ class AutomationWidget(QWidget):
         number_item = make_item(str(row + 1))
         number_item.setTextAlignment(Qt.AlignCenter)
         self.targets_table.setItem(row, 0, number_item)
-
-        x_spin = QSpinBox()
-        x_spin.setRange(0, 100000)
-        x_spin.setValue(int(x))
-        y_spin = QSpinBox()
-        y_spin.setRange(0, 100000)
-        y_spin.setValue(int(y))
-        self.targets_table.setCellWidget(row, 1, x_spin)
-        self.targets_table.setCellWidget(row, 2, y_spin)
-        # Keep the visible sort keys in step with the spin values.
-        x_spin.valueChanged.connect(
-            lambda v, r=row: self._reindex_points())
-        y_spin.valueChanged.connect(
-            lambda v, r=row: self._reindex_points())
+        point_item = make_item(f"({int(x)}, {int(y)})")
+        point_item.setData(Qt.UserRole, (int(x), int(y)))
+        self.targets_table.setItem(row, 1, point_item)
 
     def _reindex_points(self) -> None:
         """Renumber the '#' column after an add/remove/edit."""
@@ -3764,11 +3910,10 @@ class AutomationWidget(QWidget):
         """Read every point back out of the table as a list of dicts."""
         points: List[Dict] = []
         for row in range(self.targets_table.rowCount()):
-            x_spin = self.targets_table.cellWidget(row, 1)
-            y_spin = self.targets_table.cellWidget(row, 2)
-            if x_spin is None or y_spin is None:
-                continue
-            points.append({"x": int(x_spin.value()), "y": int(y_spin.value())})
+            item = self.targets_table.item(row, 1)
+            coords = item.data(Qt.UserRole) if item is not None else None
+            if coords and len(coords) == 2:
+                points.append({"x": int(coords[0]), "y": int(coords[1])})
         return points
 
     def _remove_selected_points(self) -> None:
@@ -3842,6 +3987,9 @@ class AutomationWidget(QWidget):
         config_repo.set_setting(
             conn, "min_evidence", str(int(self.min_evidence_spin.value())))
         config_repo.set_setting(
+            conn, "ignore_click_conditions",
+            "1" if self.ignore_click_conditions_check.isChecked() else "0")
+        config_repo.set_setting(
             conn, "recent_safeguard_enabled",
             "1" if self.recent_safeguard_check.isChecked() else "0")
         config_repo.set_setting(
@@ -3863,6 +4011,19 @@ class AutomationWidget(QWidget):
             calibration_payload(p["x"], p["y"]) for p in self._collect_points()
         ]
         config_repo.set_click_targets(conn, payloads)
+        workflow = []
+        by_position = {}
+        for amount in self._amount_steps:
+            by_position.setdefault(max(0, int(amount.get("after", 0))), []).append(amount)
+        for position in range(len(payloads) + 1):
+            for amount in by_position.get(position, []):
+                workflow.append({"type": "amount", "mode": amount.get("mode", "auto"),
+                                 "value": amount.get("value", 0)})
+            if position < len(payloads):
+                workflow.append({"type": "click", "target": payloads[position]})
+        config_repo.set_click_workflow(conn, workflow)
+        import json
+        config_repo.set_setting(conn, "click_amount_actions", json.dumps(self._amount_steps))
         config_repo.set_click_sequence_delay_ms(conn, int(self.delay_spin.value()))
         conn.commit()
 
@@ -3933,6 +4094,69 @@ class AutomationWidget(QWidget):
             )
         else:
             self.last_event_label.setText("No click event recorded yet")
+
+
+class InputAmountWidget(QWidget):
+    """Calibrate every numeric keypad position used by amount actions."""
+    def __init__(self, engine, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self._selector = None
+        layout = _scrolled_page(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+        page_header(layout, "Input Amount",
+                    "Calibrate screen positions for digits 0–9, decimal point, Clear, and Done.")
+        self.key_buttons = {}
+        grid = QGridLayout()
+        keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", ".", "clear", "done"]
+        for i, key in enumerate(keys):
+            label = {"clear": "Clear", "done": "Done", ".": ". (decimal)"}.get(key, key)
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, k=key: self._pick(k))
+            grid.addWidget(button, i // 3, i % 3)
+            self.key_buttons[key] = button
+        layout.addLayout(grid)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.save_btn = make_button("Save Keypad Positions", "primary")
+        self.save_btn.clicked.connect(self._save)
+        layout.addWidget(self.save_btn)
+        self._load()
+
+    def _load(self):
+        self.positions = (config_repo.get_amount_keypad(self.engine._conn)
+                          if self.engine and self.engine._conn else {})
+        self._refresh()
+
+    def _refresh(self):
+        missing = [key for key in self.key_buttons if key not in self.positions]
+        calibrated = ", ".join(
+            f"{key}=({self.positions[key]['x']}, {self.positions[key]['y']})"
+            for key in self.key_buttons if key in self.positions) or "none"
+        self.status.setText("Calibrated: " + calibrated + "\n" +
+                            ("Still needed: " + ", ".join(missing) if missing else "Keypad ready."))
+
+    def _pick(self, key):
+        self._pending_key = key
+        self._selector = PointSelectorOverlay()
+        self._selector.point_selected.connect(self._selected)
+        self._selector.show()
+        self._selector.activateWindow()
+
+    def _selected(self, x, y):
+        px, py, _, _ = logical_rect_to_physical(x, y, 1, 1)
+        from src.automation.clicker import calibration_payload
+        self.positions[self._pending_key] = calibration_payload(px, py)
+        self._refresh()
+
+    def _save(self):
+        if self.engine and self.engine._conn:
+            config_repo.set_amount_keypad(self.engine._conn, self.positions)
+            self.engine._conn.commit()
+            self._refresh()
+            QMessageBox.information(self, "Keypad Saved", "Amount keypad positions saved.")
 
 
 class ActivityWidget(QWidget):
@@ -4278,13 +4502,14 @@ class MainWindow(QMainWindow):
         self.btn_history = QPushButton("History")
         self.btn_learning = QPushButton("Learning")
         self.btn_automation = QPushButton("Automation")
+        self.btn_input_amount = QPushButton("Input Amount")
         self.btn_activity = QPushButton("Activity")
         self.btn_settings = QPushButton("Settings")
 
         self._nav_buttons = [
             self.btn_dashboard, self.btn_regions, self.btn_history,
-            self.btn_learning, self.btn_automation, self.btn_activity,
-            self.btn_settings,
+            self.btn_learning, self.btn_automation, self.btn_input_amount,
+            self.btn_activity, self.btn_settings,
         ]
         for button in self._nav_buttons:
             button.setCheckable(True)
@@ -4313,13 +4538,14 @@ class MainWindow(QMainWindow):
         self.history_page = HistoryWidget(self.engine)
         self.learning_page = LearningWidget(self.engine)
         self.automation_page = AutomationWidget(self.engine)
+        self.input_amount_page = InputAmountWidget(self.engine)
         self.activity_page = ActivityWidget(self.engine)
         self.settings_page = SettingsWidget(self.engine)
 
         self.pages = [
             self.dashboard_page, self.regions_page, self.history_page,
-            self.learning_page, self.automation_page, self.activity_page,
-            self.settings_page,
+            self.learning_page, self.automation_page, self.input_amount_page,
+            self.activity_page, self.settings_page,
         ]
         for page in self.pages:
             self.stack.addWidget(page)

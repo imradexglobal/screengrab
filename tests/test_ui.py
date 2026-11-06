@@ -1,6 +1,6 @@
 """Tests for Screen Monitor GUI components.
 
-The window must expose exactly seven pages, a two-slot region model, and the
+The window must expose exactly eight pages, a two-slot region model, and the
 mandatory "Recalculate App Brain" action.  No control may be decorative: each
 assertion below corresponds to a real backend capability.
 """
@@ -27,16 +27,16 @@ def qapp():
 
 
 def test_main_window_creation(qapp):
-    """MainWindow instantiates with exactly seven pages."""
+    """MainWindow instantiates with exactly eight pages."""
     window = MainWindow()
     assert window is not None
     assert window.windowTitle() == "Screen Monitor - Number Detection"
-    assert window.stack.count() == 7
+    assert window.stack.count() == 8
     assert window.engine is not None
     window.close()
 
 
-def test_all_seven_pages_exist(qapp):
+def test_all_eight_pages_exist(qapp):
     window = MainWindow()
     assert window.dashboard_page is not None
     assert window.regions_page is not None
@@ -45,6 +45,7 @@ def test_all_seven_pages_exist(qapp):
     assert window.automation_page is not None
     assert window.activity_page is not None
     assert window.settings_page is not None
+    assert window.input_amount_page is not None
 
     # The stacked widget order must be stable: index -> page.
     assert window.stack.widget(0) is window.dashboard_page
@@ -52,8 +53,9 @@ def test_all_seven_pages_exist(qapp):
     assert window.stack.widget(2) is window.history_page
     assert window.stack.widget(3) is window.learning_page
     assert window.stack.widget(4) is window.automation_page
-    assert window.stack.widget(5) is window.activity_page
-    assert window.stack.widget(6) is window.settings_page
+    assert window.stack.widget(5) is window.input_amount_page
+    assert window.stack.widget(6) is window.activity_page
+    assert window.stack.widget(7) is window.settings_page
     window.close()
 
 
@@ -108,13 +110,19 @@ def test_automation_widget_gate_is_not_configurable(qapp):
     window = MainWindow()
     automation = window.automation_page
     assert automation.kill_btn is not None
+    assert automation.test_sequence_btn.text() == "Test Click Sequence Now (LIVE)"
     assert automation.enable_check is not None
     assert automation.dry_run_check is not None
     assert automation.confidence_spin is not None
     assert automation.min_evidence_spin is not None
     assert automation.recent_min_accuracy_spin is not None
     assert automation.cooldown_spin is not None
+    assert automation.ignore_click_conditions_check is not None
+    assert automation.targets_table.columnCount() == 2
+    assert automation.amount_steps_list is not None
+    assert automation.amount_new_btn is not None
     assert automation.categories_list.count() == 9
+    assert "." in window.input_amount_page.key_buttons
 
     # The gate value must come from the backend, never from a local widget.
     assert f"{MANDATORY_REGION_A_RECORDS:,}" in automation.gate_label.text()
