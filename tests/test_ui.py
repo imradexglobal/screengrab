@@ -14,7 +14,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from src.database.init_db import REGION_A_ID, REGION_B_ID
-from src.ui.main_window import MainWindow, MANDATORY_REGION_A_RECORDS
+from src.ui.main_window import MainWindow
 
 
 @pytest.fixture(scope="session")
@@ -76,8 +76,8 @@ def test_dashboard_widget(qapp):
     assert dashboard.pause_btn.isEnabled() is False
     assert dashboard.stop_btn.isEnabled() is False
     assert "Idle" in dashboard.status_label.text()
-    # The mandatory gate must be visible on the dashboard.
-    assert "1,000" in dashboard.gate_label.text()
+    # Row availability is informational; it must not lock clicking.
+    assert "no minimum" in dashboard.gate_label.text().lower()
     window.close()
 
 
@@ -98,6 +98,8 @@ def test_learning_widget_recalculate_button(qapp):
     learning = window.learning_page
     assert learning.recalc_btn.text() == "Recalculate App Brain"
     assert learning.recalc_btn.isEnabled() is True
+    assert learning.generate_patterns_btn.text() == "Generate Most Frequent"
+    assert learning.generate_patterns_btn.isEnabled() is True
     assert learning.patterns_table.columnCount() == 11
     # Patterns are user-defined: the builder and its kind selector exist.
     assert learning.kind_combo.count() == 2
@@ -105,8 +107,8 @@ def test_learning_widget_recalculate_button(qapp):
     window.close()
 
 
-def test_automation_widget_gate_is_not_configurable(qapp):
-    """Automation exposes its controls but no way to change the 1,000 gate."""
+def test_automation_widget_has_no_row_threshold_control(qapp):
+    """Automation exposes its controls without a minimum-row threshold."""
     window = MainWindow()
     automation = window.automation_page
     assert automation.kill_btn is not None
@@ -124,8 +126,7 @@ def test_automation_widget_gate_is_not_configurable(qapp):
     assert automation.categories_list.count() == 9
     assert "." in window.input_amount_page.key_buttons
 
-    # The gate value must come from the backend, never from a local widget.
-    assert f"{MANDATORY_REGION_A_RECORDS:,}" in automation.gate_label.text()
+    assert "no minimum" in automation.gate_label.text().lower()
     window.close()
 
 

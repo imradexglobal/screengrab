@@ -1,9 +1,9 @@
 """Tests for the user-defined pattern brain.
 
-The application must never invent patterns: every learned row has to come from
-a ``pattern_definitions`` row the user added.  These tests cover movement
-classification, range and movement patterns, the cross-outcome tables and the
-round trip through "Recalculate App Brain".
+Every learned row has to come from a ``pattern_definitions`` row created
+manually or through the explicit generator. These tests cover movement
+classification, range and movement patterns, generated patterns, the
+cross-outcome tables and the round trip through "Recalculate App Brain".
 """
 
 import os
@@ -168,6 +168,21 @@ class TestMovementPattern:
 
 
 class TestManualPatternRoundTrip:
+    def test_generate_most_frequent_replaces_existing_patterns(self, temp_db):
+        conn = temp_db
+        _seed(conn, [1.10, 1.30, 1.10, 1.30] * 8,
+              ["g1", "g2", "g1", "g2"] * 8)
+        learn_repo.create_pattern_definition(conn, KIND_RANGE, ("g1", "g2"), "old")
+
+        generated = learn_repo.generate_most_frequent_movement_patterns(conn)
+
+        assert 1 <= len(generated) <= 5
+        definitions = learn_repo.list_pattern_definitions(conn)
+        assert len(definitions) == len(generated)
+        assert all(d.kind == KIND_MOVEMENT for d in definitions)
+        assert all(set(d.tokens) <= {"UP", "DOWN"} for d in definitions)
+        assert all(d.label.startswith("Most Frequent #") for d in definitions)
+
     def test_rebuild_without_patterns_publishes_an_empty_valid_model(self, temp_db):
         conn = temp_db
         _seed(conn, [1.10, 1.30, 1.10, 1.30],

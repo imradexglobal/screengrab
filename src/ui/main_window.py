@@ -102,9 +102,6 @@ logger = logging.getLogger(__name__)
 REGION_A_LABEL = "Region A — Active reader (learning + automation gate)"
 REGION_B_LABEL = "Region B — Secondary (store only)"
 
-#: Fixed, non-configurable automation gate (spec section 12).
-MANDATORY_REGION_A_RECORDS = 1000
-
 #: Dimensions of the live outcome grid on the dashboard: 6 columns x 10 rows.
 LIVE_GRID_COLUMNS = 6
 LIVE_GRID_ROWS = 10
@@ -133,6 +130,47 @@ QToolTip {
     border: 1px solid #334155;
     padding: 4px 6px;
 }
+/* Native message boxes inherit the application palette inconsistently on
+   Windows.  Keep their body text and actions explicitly high contrast. */
+QMessageBox, QDialog {
+    background-color: #ffffff;
+    color: #0f172a;
+}
+QMessageBox QLabel, QDialog QLabel {
+    color: #0f172a;
+    background-color: transparent;
+    min-width: 360px;
+    padding: 6px;
+}
+QMessageBox QPushButton, QDialog QPushButton {
+    min-width: 88px;
+    min-height: 34px;
+    padding: 6px 16px;
+    border: 1px solid #94a3b8;
+    border-radius: 6px;
+    background-color: #f8fafc;
+    color: #0f172a;
+    font-weight: 600;
+}
+QMessageBox QPushButton:hover, QDialog QPushButton:hover {
+    background-color: #dbeafe;
+    border-color: #2563eb;
+    color: #0f172a;
+}
+QMessageBox QPushButton:default, QDialog QPushButton:default {
+    background-color: #2563eb;
+    border-color: #1d4ed8;
+    color: #ffffff;
+}
+QMessageBox QPushButton:default:hover, QDialog QPushButton:default:hover {
+    background-color: #1d4ed8;
+    color: #ffffff;
+}
+QMessageBox QPushButton:disabled, QDialog QPushButton:disabled {
+    background-color: #eef2f6;
+    border-color: #dde4ea;
+    color: #7d8b9c;
+}
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QListWidget {
     min-height: 30px;
     padding: 3px 8px;
@@ -145,6 +183,34 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QListWidget {
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus,
 QDoubleSpinBox:focus, QDateEdit:focus {
     border: 1px solid #0ea5e9;
+}
+QCheckBox, QRadioButton {
+    spacing: 8px;
+    min-height: 28px;
+    color: #1e293b;
+}
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 18px;
+    height: 18px;
+}
+QCheckBox::indicator {
+    border: 1px solid #94a3b8;
+    border-radius: 4px;
+    background-color: #ffffff;
+}
+QCheckBox::indicator:hover { border-color: #2563eb; background-color: #eff6ff; }
+QCheckBox::indicator:checked {
+    border-color: #2563eb;
+    background-color: #2563eb;
+}
+QRadioButton::indicator {
+    border: 1px solid #94a3b8;
+    border-radius: 9px;
+    background-color: #ffffff;
+}
+QRadioButton::indicator:checked {
+    border: 5px solid #2563eb;
+    background-color: #ffffff;
 }
 /* Spin boxes and combo boxes keep their natural width in wide forms. */
 QSpinBox { max-width: 170px; }
@@ -251,6 +317,7 @@ QTableWidget {
     selection-background-color: #dbeafe;
     selection-color: #0f172a;
 }
+QTableWidget::item { padding: 6px 8px; }
 QHeaderView::section {
     padding: 8px 8px;
     border: none;
@@ -939,7 +1006,7 @@ class DashboardWidget(QWidget):
         gate_group = QGroupBox("Automation Gate && Learning Status")
         gate_layout = QFormLayout(gate_group)
         gate_layout.setHorizontalSpacing(10)
-        self.gate_label = QLabel("Auto-click locked: 0 / 1,000 valid Region A readings.")
+        self.gate_label = QLabel("Auto-click available; 0 valid Region A readings recorded.")
         gate_font = QFont()
         gate_font.setBold(True)
         self.gate_label.setFont(gate_font)
@@ -952,9 +1019,9 @@ class DashboardWidget(QWidget):
 
         _form_caption(
             gate_layout, "Gate:", self.gate_label,
-            "Automation unlocks only after 1,000 valid Region A readings are "
-            "stored. The count is re-read from the database on every click "
-            "attempt and cannot be changed here.")
+            "The live Region A count is informational. Clicking is available "
+            "regardless of how many readings are currently stored; the count is "
+            "re-read from the database on every click attempt.")
         _form_caption(
             gate_layout, "Model state:", self.model_status_label,
             "VALID means the learned patterns were built from the current "
@@ -1031,7 +1098,7 @@ class DashboardWidget(QWidget):
         self.live_caption.setStyleSheet("color: #64748b; font-size: 9pt;")
         live_layout.addWidget(self.live_caption)
 
-        self.live_gate_caption = QLabel("Gate: 0 / 1,000")
+        self.live_gate_caption = QLabel("Region A readings available: 0")
         self.live_gate_caption.setStyleSheet(
             "color: #334155; font-weight: bold; font-size: 9pt;")
         live_layout.addWidget(self.live_gate_caption)
@@ -1263,9 +1330,8 @@ class DashboardWidget(QWidget):
         try:
             gate = self.engine.gate_status()
             count = int(gate.get("region_a_count", 0))
-            required = int(gate.get("required", MANDATORY_REGION_A_RECORDS))
             self.live_gate_caption.setText(
-                f"Gate: {count:,} / {required:,} valid Region A readings   "
+                f"Region A readings available: {count:,}   "
                 f"({min(len(rows), LIVE_GRID_CELLS)} newest shown of {LIVE_GRID_CELLS})")
         except Exception:  # noqa: BLE001
             pass
@@ -1406,15 +1472,9 @@ class DashboardWidget(QWidget):
             return
 
         count = int(gate.get("region_a_count", 0))
-        required = int(gate.get("required", MANDATORY_REGION_A_RECORDS))
-        if gate.get("unlocked"):
-            self.gate_label.setText(
-                f"Auto-click unlocked: {count:,} / {required:,} valid Region A readings.")
-            self.gate_label.setStyleSheet("color: #2e7d32;")
-        else:
-            self.gate_label.setText(
-                f"Auto-click locked: {count:,} / {required:,} valid Region A readings.")
-            self.gate_label.setStyleSheet("color: #c62828;")
+        self.gate_label.setText(
+            f"Auto-click available; {count:,} valid Region A readings recorded.")
+        self.gate_label.setStyleSheet("color: #2e7d32;")
 
         conn = self.engine._conn
         try:
@@ -2507,12 +2567,13 @@ class SettingsWidget(QWidget):
 
 
 class LearningWidget(QWidget):
-    """User-defined patterns, their outcomes and model recalculation.
+    """Generated or user-defined patterns, their outcomes and recalculation.
 
-    The application never discovers patterns by itself.  Every row in
-    "My Patterns" was added by the user, and only enabled definitions are
-    learned.  Editing a definition marks the model stale and schedules a
-    debounced rebuild so the outcome tables stay in step with the definitions.
+    Patterns can be added manually or replaced with the five strongest observed
+    UP/DOWN sequences from the configured range history. Only enabled
+    definitions are learned. Editing a definition marks the model stale and
+    schedules a debounced rebuild so the outcome tables stay in step with the
+    definitions.
     """
 
     recalc_progress = Signal(float, str)
@@ -2546,9 +2607,9 @@ class LearningWidget(QWidget):
         layout.setContentsMargins(20, 20, 20, 20)
         page_header(
             layout, "Learning",
-            "Patterns are added by you — the app never discovers or generates "
-            "them automatically. Each pattern reports what tends to follow it "
-            "as the next number range and as the next up/down movement.")
+            "Add patterns manually or generate the five most frequent, strongest "
+            "UP/DOWN patterns from the configured range history. Each pattern "
+            "reports what tends to follow it as the next range and movement.")
 
         # --- model summary ------------------------------------------------
         summary_group = QGroupBox("Model Summary")
@@ -2698,17 +2759,24 @@ class LearningWidget(QWidget):
         self.delete_pattern_btn = make_button(
             "Delete Pattern", "danger",
             "Delete the selected pattern and its derived outcomes.")
+        self.generate_patterns_btn = make_button(
+            "Generate Most Frequent", "accent",
+            "Clear existing patterns and generate the five strongest observed "
+            "UP/DOWN patterns from readings inside the configured ranges.")
         for button in (self.toggle_pattern_btn, self.rename_pattern_btn,
-                       self.set_expected_btn, self.delete_pattern_btn):
+                       self.set_expected_btn, self.delete_pattern_btn,
+                       self.generate_patterns_btn):
             button.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.toggle_pattern_btn.clicked.connect(self._on_toggle_pattern)
         self.rename_pattern_btn.clicked.connect(self._on_rename_pattern)
         self.set_expected_btn.clicked.connect(self._on_set_expected)
         self.delete_pattern_btn.clicked.connect(self._on_delete_pattern)
+        self.generate_patterns_btn.clicked.connect(self._on_generate_most_frequent)
         pattern_buttons.addWidget(self.toggle_pattern_btn)
         pattern_buttons.addWidget(self.rename_pattern_btn)
         pattern_buttons.addWidget(self.set_expected_btn)
         pattern_buttons.addWidget(self.delete_pattern_btn)
+        pattern_buttons.addWidget(self.generate_patterns_btn)
         pattern_buttons.addStretch(1)
         patterns_layout.addLayout(pattern_buttons)
         layout.addWidget(patterns_group, 1)
@@ -3258,6 +3326,39 @@ class LearningWidget(QWidget):
         self.engine.delete_pattern(pattern_id)
         self.refresh()
 
+    def _on_generate_most_frequent(self):
+        """Replace the current pattern table with five observed UP/DOWN patterns."""
+        if not self.engine or self.engine._conn is None:
+            QMessageBox.warning(self, "Generate Most Frequent",
+                                "The database is not available.")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Generate Most Frequent",
+            "Clear all existing patterns and replace them with the five strongest "
+            "UP/DOWN patterns found in the configured range history?\n\n"
+            "Raw readings are not deleted.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        try:
+            generated = self.engine.generate_most_frequent_patterns(limit=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not generate frequent patterns: %s", exc,
+                         exc_info=True)
+            QMessageBox.critical(
+                self, "Generate Most Frequent",
+                f"Pattern generation failed:\n{exc}")
+            return
+        self.refresh()
+        if generated:
+            self.recalc_status_label.setText(
+                f"Generated {len(generated)} patterns — rebuilding outcomes shortly…")
+        else:
+            self.recalc_status_label.setText(
+                "No UP/DOWN patterns were found in the configured range history.")
+
     # ------------------------------------------------------------------
     # Rebuild scheduling
     # ------------------------------------------------------------------
@@ -3329,6 +3430,7 @@ class LearningWidget(QWidget):
         self._recalculating = True
         self.recalc_btn.setEnabled(False)
         self.add_pattern_btn.setEnabled(False)
+        self.generate_patterns_btn.setEnabled(False)
         self.recalc_status_label.setText("Recalculating...")
         self.recalc_progress_bar.setValue(0)
         threading.Thread(target=self._recalculate_worker, daemon=True).start()
@@ -3350,6 +3452,7 @@ class LearningWidget(QWidget):
         self.recalc_btn.setEnabled(False)
         self.recalc_expected_btn.setEnabled(False)
         self.add_pattern_btn.setEnabled(False)
+        self.generate_patterns_btn.setEnabled(False)
         self.recalc_status_label.setText("Recalculating expected hits...")
         self.recalc_progress_bar.setValue(0)
         threading.Thread(target=self._recalc_expected_hits_worker, daemon=True).start()
@@ -3374,6 +3477,7 @@ class LearningWidget(QWidget):
         self._recalculating = False
         self.recalc_btn.setEnabled(True)
         self.add_pattern_btn.setEnabled(True)
+        self.generate_patterns_btn.setEnabled(True)
         self.recalc_progress_bar.setValue(100 if result.get("ok") else 0)
         if result.get("ok"):
             self.recalc_status_label.setText(
@@ -3456,7 +3560,7 @@ class LearningWidget(QWidget):
 
 
 class AutomationWidget(QWidget):
-    """Automated-click configuration. The 1,000-record gate is not configurable."""
+    """Automated-click configuration with no minimum-row prerequisite."""
 
     settings_changed = Signal(dict)
 
@@ -3481,8 +3585,8 @@ class AutomationWidget(QWidget):
         layout.setContentsMargins(20, 20, 20, 20)
         page_header(
             layout, "Automation",
-            "Decide when the app is allowed to click. Every click is gated by "
-            "1,000 valid Region A readings and stays in dry-run until you "
+            "Decide when the app is allowed to click. Clicking is available "
+            "regardless of the number of stored Region A readings and stays in dry-run until you "
             "switch it on.")
 
         # Top row: gate status beside the master switches.
@@ -3492,25 +3596,31 @@ class AutomationWidget(QWidget):
         gate_group = QGroupBox("Automation Gate")
         gate_layout = QFormLayout(gate_group)
         gate_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.gate_label = QLabel("0 / 1,000 valid Region A readings")
+        self.gate_label = QLabel("0 valid Region A readings; no minimum required")
         self.gate_label.setStyleSheet("font-weight: bold;")
         self.eligibility_label = QLabel("-")
         self.last_event_label = QLabel("No click event recorded yet")
         self.last_event_label.setWordWrap(True)
+        self.last_event_label.setStyleSheet(
+            "color: #475569; background-color: #f8fafc; "
+            "border: 1px solid #e2e8f0; border-radius: 6px; padding: 7px;")
         add_help_row(gate_layout, "Qualifying Region A records", self.gate_label,
-                     "Region A readings that count towards the mandatory gate. "
-                     "The gate is fixed at 1,000 and cannot be changed.")
+                     "The current Region A count is informational only. No minimum "
+                     "number of readings is required before clicking.")
         add_help_row(gate_layout, "Current click eligibility", self.eligibility_label,
                      "Whether clicking may happen right now, and if not, why.")
         add_help_row(gate_layout, "Last click / block event", self.last_event_label,
                      "The most recent click attempt and its outcome or block reason.")
 
         gate_note = QLabel(
-            "The 1,000-record Region A gate is mandatory and non-configurable. "
-            "It is enforced inside the automation execution path, not in this window."
+            "There is no minimum Region A record requirement. Other safety "
+            "conditions are still enforced inside the automation execution path."
         )
         gate_note.setWordWrap(True)
-        gate_note.setStyleSheet("color: #c62828;")
+        gate_note.setStyleSheet(
+            "color: #92400e; background-color: #fffbeb; "
+            "border: 1px solid #fde68a; border-radius: 6px; "
+            "padding: 7px 8px;")
         gate_layout.addRow("", gate_note)
         top_row.addWidget(gate_group, 3)
 
@@ -3550,7 +3660,7 @@ class AutomationWidget(QWidget):
             "Trigger on active pattern match (ignore prediction statistics)")
         self.ignore_click_conditions_check.setToolTip(
             "A match from an active pattern can trigger without outcome statistics. "
-            "The master enable, mandatory Region A record gate, and dispatch safeguards remain active.")
+            "The master enable and dispatch safeguards remain active.")
         conditions_layout.addRow("", self.ignore_click_conditions_check)
 
         self.recent_safeguard_check = QCheckBox("Enable recent-accuracy safeguard")
@@ -3659,6 +3769,8 @@ class AutomationWidget(QWidget):
         target_layout.addLayout(delay_row)
 
         amount_row = QHBoxLayout()
+        amount_row.setSpacing(8)
+        amount_row.addWidget(QLabel("Insert after click locations:"))
         self.amount_position_spin = QSpinBox()
         self.amount_position_spin.setRange(0, 100)
         self.amount_position_spin.setToolTip(
@@ -3672,21 +3784,26 @@ class AutomationWidget(QWidget):
         self.amount_value_spin.setEnabled(False)
         self.amount_mode_combo.currentIndexChanged.connect(
             lambda i: self.amount_value_spin.setEnabled(i == 1))
+        amount_row.addWidget(self.amount_position_spin)
+        amount_row.addWidget(self.amount_mode_combo, 1)
+        amount_row.addWidget(self.amount_value_spin)
+        amount_row.addStretch(1)
+        target_layout.addLayout(amount_row)
+
+        amount_actions_row = QHBoxLayout()
+        amount_actions_row.setSpacing(8)
         self.amount_new_btn = make_button("New Amount Step", "quiet")
         self.amount_new_btn.clicked.connect(self._new_amount_step)
         self.amount_add_btn = make_button("Add / Update Selected", "accent")
         self.amount_add_btn.clicked.connect(self._add_amount_step)
         self.amount_remove_btn = make_button("Remove Selected", "danger")
         self.amount_remove_btn.clicked.connect(self._remove_selected_amount_step)
-        amount_row.addWidget(QLabel("Insert after click locations:"))
-        amount_row.addWidget(self.amount_position_spin)
-        amount_row.addWidget(self.amount_mode_combo)
-        amount_row.addWidget(self.amount_value_spin)
-        amount_row.addWidget(self.amount_new_btn)
-        amount_row.addWidget(self.amount_add_btn)
-        amount_row.addWidget(self.amount_remove_btn)
-        target_layout.addLayout(amount_row)
-        target_layout.addWidget(QLabel("Saved amount steps (select a row to edit):"))
+        amount_actions_row.addWidget(self.amount_new_btn)
+        amount_actions_row.addWidget(self.amount_add_btn)
+        amount_actions_row.addWidget(self.amount_remove_btn)
+        amount_actions_row.addStretch(1)
+        target_layout.addLayout(amount_actions_row)
+        target_layout.addWidget(QLabel("Saved amount steps — select a row to edit:"))
         self.amount_steps_list = QListWidget()
         self.amount_steps_list.setMinimumHeight(90)
         self.amount_steps_list.currentRowChanged.connect(self._select_amount_step)
@@ -3838,6 +3955,12 @@ class AutomationWidget(QWidget):
     def _test_click_sequence(self):
         if not self.engine:
             return
+        if not self._persist_current_workflow(require_targets=True):
+            QMessageBox.warning(
+                self, "Test Click Sequence",
+                "The current click sequence could not be saved. "
+                "Add at least one valid click target and try again.")
+            return
         decision = self.engine.test_click_sequence()
         if decision is None:
             QMessageBox.warning(self, "Test Click Sequence", "Automation engine is not ready.")
@@ -3846,6 +3969,48 @@ class AutomationWidget(QWidget):
         else:
             QMessageBox.warning(self, "Test Sequence Result", decision.message)
         self.refresh_status()
+
+    def _persist_current_workflow(self, require_targets: bool = False) -> bool:
+        """Save the click sequence currently visible on the Automation page."""
+        if not self.engine or self.engine._conn is None:
+            return False
+        try:
+            conn = self.engine._conn
+            from src.automation.clicker import calibration_payload
+            payloads = [
+                calibration_payload(p["x"], p["y"])
+                for p in self._collect_points()
+            ]
+            if require_targets and not payloads:
+                return False
+            by_position = {}
+            for amount in self._amount_steps:
+                by_position.setdefault(
+                    max(0, int(amount.get("after", 0))), []).append(amount)
+            workflow = []
+            for position in range(len(payloads) + 1):
+                for amount in by_position.get(position, []):
+                    workflow.append({
+                        "type": "amount",
+                        "mode": amount.get("mode", "auto"),
+                        "value": amount.get("value", 0),
+                    })
+                if position < len(payloads):
+                    workflow.append({"type": "click", "target": payloads[position]})
+            config_repo.set_click_targets(conn, payloads)
+            config_repo.set_click_workflow(conn, workflow)
+            import json
+            config_repo.set_setting(
+                conn, "click_amount_actions", json.dumps(self._amount_steps))
+            config_repo.set_click_sequence_delay_ms(
+                conn, int(self.delay_spin.value()))
+            conn.commit()
+            self.engine.reload()
+            return True
+        except (TypeError, ValueError, KeyError, sqlite3.Error) as exc:
+            logger.error("Could not persist current click workflow: %s", exc,
+                         exc_info=True)
+            return False
 
     def _load_target(self):
         """Fill the point sequence from the stored click targets."""
@@ -4006,34 +4171,17 @@ class AutomationWidget(QWidget):
                 selected.append(item.data(Qt.UserRole))
         config_repo.set_allowed_categories(conn, selected)
 
-        from src.automation.clicker import calibration_payload
-        payloads = [
-            calibration_payload(p["x"], p["y"]) for p in self._collect_points()
-        ]
-        config_repo.set_click_targets(conn, payloads)
-        workflow = []
-        by_position = {}
-        for amount in self._amount_steps:
-            by_position.setdefault(max(0, int(amount.get("after", 0))), []).append(amount)
-        for position in range(len(payloads) + 1):
-            for amount in by_position.get(position, []):
-                workflow.append({"type": "amount", "mode": amount.get("mode", "auto"),
-                                 "value": amount.get("value", 0)})
-            if position < len(payloads):
-                workflow.append({"type": "click", "target": payloads[position]})
-        config_repo.set_click_workflow(conn, workflow)
-        import json
-        config_repo.set_setting(conn, "click_amount_actions", json.dumps(self._amount_steps))
-        config_repo.set_click_sequence_delay_ms(conn, int(self.delay_spin.value()))
-        conn.commit()
-
-        self.engine.reload()
+        if not self._persist_current_workflow(require_targets=False):
+            QMessageBox.warning(
+                self, "Automation Settings",
+                "Automation settings could not be saved. Check the click targets.")
+            return
         self._load_target()
         self.settings_changed.emit({"automation": "saved"})
         QMessageBox.information(
             self, "Automation Settings Saved",
-            "Automation settings saved. The 1,000-record Region A gate remains "
-            "mandatory and cannot be changed here.")
+            "Automation settings saved. Clicking is available regardless of the "
+            "number of stored Region A readings.")
 
     def _kill_switch(self):
         if not self.engine:
@@ -4057,18 +4205,12 @@ class AutomationWidget(QWidget):
             return
 
         count = int(gate.get("region_a_count", 0))
-        required = int(gate.get("required", MANDATORY_REGION_A_RECORDS))
-        self.gate_label.setText(f"{count:,} / {required:,} valid Region A readings")
-        self.gate_label.setStyleSheet(
-            "font-weight: bold; color: #2e7d32;" if gate.get("unlocked")
-            else "font-weight: bold; color: #c62828;")
+        self.gate_label.setText(
+            f"{count:,} valid Region A readings; no minimum required")
+        self.gate_label.setStyleSheet("font-weight: bold; color: #2e7d32;")
 
         if gate.get("killed"):
             eligibility = "Blocked - kill switch is engaged"
-        elif not gate.get("unlocked"):
-            eligibility = (
-                f"Blocked - {max(0, required - count):,} more valid Region A "
-                "readings required")
         elif not gate.get("auto_click_enabled"):
             eligibility = "Blocked - automated clicking is switched off"
         elif gate.get("rebuilding"):
@@ -4080,6 +4222,16 @@ class AutomationWidget(QWidget):
         else:
             eligibility = "Eligible - live clicking is active"
         self.eligibility_label.setText(eligibility)
+        if eligibility.startswith("Eligible"):
+            self.eligibility_label.setStyleSheet(
+                "color: #166534; background-color: #f0fdf4; "
+                "border: 1px solid #bbf7d0; border-radius: 6px; "
+                "padding: 6px; font-weight: 600;")
+        else:
+            self.eligibility_label.setStyleSheet(
+                "color: #991b1b; background-color: #fef2f2; "
+                "border: 1px solid #fecaca; border-radius: 6px; "
+                "padding: 6px; font-weight: 600;")
 
         audit = self.engine.click_audit(limit=1)
         if audit:
@@ -4109,10 +4261,13 @@ class InputAmountWidget(QWidget):
                     "Calibrate screen positions for digits 0–9, decimal point, Clear, and Done.")
         self.key_buttons = {}
         grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
         keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", ".", "clear", "done"]
         for i, key in enumerate(keys):
             label = {"clear": "Clear", "done": "Done", ".": ". (decimal)"}.get(key, key)
             button = QPushButton(label)
+            button.setMinimumSize(120, 46)
             button.clicked.connect(lambda checked=False, k=key: self._pick(k))
             grid.addWidget(button, i // 3, i % 3)
             self.key_buttons[key] = button
@@ -4135,8 +4290,18 @@ class InputAmountWidget(QWidget):
         calibrated = ", ".join(
             f"{key}=({self.positions[key]['x']}, {self.positions[key]['y']})"
             for key in self.key_buttons if key in self.positions) or "none"
-        self.status.setText("Calibrated: " + calibrated + "\n" +
-                            ("Still needed: " + ", ".join(missing) if missing else "Keypad ready."))
+        self.status.setText(
+            "Calibrated: " + calibrated + "\n" +
+            ("Still needed: " + ", ".join(missing)
+             if missing else "Keypad ready — all amount controls are configured."))
+        if missing:
+            self.status.setStyleSheet(
+                "color: #92400e; background-color: #fffbeb; "
+                "border: 1px solid #fde68a; border-radius: 6px; padding: 10px;")
+        else:
+            self.status.setStyleSheet(
+                "color: #166534; background-color: #f0fdf4; "
+                "border: 1px solid #bbf7d0; border-radius: 6px; padding: 10px;")
 
     def _pick(self, key):
         self._pending_key = key
@@ -4327,6 +4492,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.setWindowTitle("Screen Monitor")
+        self.setMinimumSize(1120, 720)
+        self.resize(1380, 860)
         self.engine: Optional[MonitoringEngine] = None
         self.region_manager: Optional[RegionManager] = None
         self.tray_icon = None
@@ -4452,7 +4620,7 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(0)
 
         sidebar = QWidget()
-        sidebar.setFixedWidth(210)
+        sidebar.setFixedWidth(224)
         sidebar.setStyleSheet(
             """
             QWidget {
@@ -4468,6 +4636,7 @@ class MainWindow(QMainWindow):
                 border-left: 4px solid transparent;
                 text-align: left;
                 padding: 12px 18px;
+                min-height: 44px;
                 font-size: 14px;
                 font-weight: 500;
             }

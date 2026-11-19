@@ -8,7 +8,7 @@ same derived data.
 import json
 import logging
 import sqlite3
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -412,6 +412,111 @@ def delete_pattern_definition(conn: sqlite3.Connection, pattern_id: int) -> bool
                           (definition_id,))
     conn.commit()
     return bool(cursor.rowcount)
+
+
+def generate_most_frequent_movement_patterns(
+    conn: sqlite3.Connection, limit: int = 5, min_length: int = 2,
+    max_length: int = 8,
+) -> List[Dict]:
+    """Replace manual patterns with the strongest observed UP/DOWN sequences.
+
+    Region A readings are first constrained to the currently configured ranges.
+    Flat movements break a sequence, so every generated definition contains only
+    ``UP`` and ``DOWN`` tokens. Candidates are ranked by observed occurrences,
+    then by how often the following movement agrees with the most common next
+    direction, and finally by length. This keeps the action named "Most
+    Frequent" frequency-first while preferring patterns with a useful outcome.
+    """
+    limit = max(0, int(limit))
+    min_length = max(MIN_PATTERN_LENGTH, int(min_length))
+    max_length = min(MAX_PATTERN_LENGTH, int(max_length))
+
+    rows = conn.execute(
+        """SELECT numeric_value, group_id, capture_timestamp, reading_id
+           FROM readings WHERE region_id = ?
+           ORDER BY reading_id ASC""",
+        ("region-A",),
+    ).fetchall()
+    range_config = load_range_config(conn)
+    classified = []
+    for row in rows:
+        try:
+            group_id = range_config.classify(float(row["numeric_value"]))
+        except (TypeError, ValueError):
+            group_id = None
+        stored_group = str(row["group_id"] or "")
+        if group_id is None and stored_group and range_config.get(stored_group):
+            group_id = stored_group
+        if group_id is not None:
+            classified.append((float(row["numeric_value"]), group_id))
+
+    movements = []
+    for previous, current in zip(classified, classified[1:]):
+        movement = movement_between(previous[0], current[0])
+        movements.append((movement, current[1]))
+
+    candidates = defaultdict(lambda: {"occurrences": 0, "next": defaultdict(int)})
+    for start in range(len(movements)):
+        if movements[start][0] not in ("UP", "DOWN"):
+            continue
+        sequence = []
+        for end in range(start, min(len(movements), start + max_length)):
+            movement, _group_id = movements[end]
+            if movement not in ("UP", "DOWN"):
+                break
+            sequence.append(movement)
+            if len(sequence) < min_length:
+                continue
+            key = tuple(sequence)
+            item = candidates[key]
+            item["occurrences"] += 1
+            next_index = end + 1
+            if next_index < len(movements):
+                next_movement = movements[next_index][0]
+                if next_movement in ("UP", "DOWN"):
+                    item["next"][next_movement] += 1
+
+    ranked = []
+    for sequence, item in candidates.items():
+        next_total = sum(item["next"].values())
+        best_next = max(item["next"].values(), default=0)
+        success_rate = best_next / next_total if next_total else 0.0
+        ranked.append((
+            -item["occurrences"], -success_rate, -len(sequence),
+            ",".join(sequence), sequence, item["occurrences"], success_rate,
+        ))
+    ranked.sort()
+
+    now = _now()
+    with conn:
+        conn.execute("DELETE FROM pattern_stats")
+        conn.execute("DELETE FROM predictions")
+        conn.execute("DELETE FROM pattern_definitions")
+        created = []
+        for ordinal, (_freq, _rate, _length, _text, sequence,
+                      occurrences, success_rate) in enumerate(ranked[:limit], 1):
+            label = f"Most Frequent #{ordinal}"
+            next_counts = candidates[sequence]["next"]
+            expected_movement = (
+                max(next_counts, key=next_counts.get) if next_counts else None
+            )
+            cursor = conn.execute(
+                """INSERT INTO pattern_definitions
+                   (kind, tokens, label, enabled, expected_kind, expected_value,
+                    created_at, updated_at)
+                VALUES (?, ?, ?, 1, ?, ?, ?, ?)""",
+                (KIND_MOVEMENT, ",".join(sequence), label,
+                 KIND_MOVEMENT if expected_movement else None,
+                 expected_movement,
+                 now, now),
+            )
+            created.append({
+                "pattern_id": int(cursor.lastrowid),
+                "sequence": ",".join(sequence),
+                "occurrences": occurrences,
+                "success_rate": success_rate,
+            })
+    return created
 
 
 # ---------------------------------------------------------------------------

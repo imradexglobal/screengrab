@@ -6,7 +6,7 @@ import tempfile
 import pytest
 
 from src.automation.clicker import AutoClickEngine, RecordingDispatcher
-from src.config.repository import set_click_target, set_setting
+from src.config.repository import set_click_target, set_click_workflow, set_setting
 from src.database.init_db import REGION_A_ID, initialise_database
 
 
@@ -72,3 +72,18 @@ def test_manual_test_does_not_require_region_a_records(conn):
     assert result.allowed is True
     assert result.outcome == "DISPATCHED"
     assert dispatcher.calls == [(100, 200)]
+
+
+def test_manual_test_reports_missing_amount_keypad_instead_of_raw_key_error(conn):
+    set_click_workflow(conn, [
+        {"type": "click", "target": {"x": 100, "y": 200}},
+        {"type": "amount", "mode": "fixed", "value": 10},
+    ])
+    conn.commit()
+
+    engine = AutoClickEngine(conn, dispatcher=RecordingDispatcher())
+    result = engine.test_sequence()
+
+    assert result.allowed is False
+    assert result.code == "AMOUNT_KEYPAD_NOT_CONFIGURED"
+    assert "clear" in result.message

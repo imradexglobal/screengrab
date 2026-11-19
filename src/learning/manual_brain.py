@@ -1,7 +1,7 @@
 """User-defined pattern brain.
 
-The application no longer discovers patterns on its own.  A pattern exists only
-because the user added it, and it is stored in ``pattern_definitions``.
+A pattern exists because the user added it manually or explicitly requested the
+Learning page's generator, and it is stored in ``pattern_definitions``.
 
 Two kinds of pattern are supported:
 

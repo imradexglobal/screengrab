@@ -1,9 +1,9 @@
 """Safe desktop auto-click engine.
 
-The mandatory 1,000-record automation gate is enforced **here**, inside the
-execution path - not in the UI.  :meth:`AutoClickEngine.try_click` re-queries
-the qualifying Region A reading count from the persistent database on every
-attempt and refuses to dispatch unless *every* safety condition passes.
+:meth:`AutoClickEngine.try_click` re-queries the qualifying Region A reading
+count from the persistent database on every attempt for status and auditing.
+There is no minimum-row prerequisite: clicking is available regardless of how
+many readings currently exist, subject to the remaining safety conditions.
 
 A dispatch may cover an arbitrary number of calibrated points: every point of
 the ``click_targets`` sequence is clicked in order with a configurable pause
@@ -39,13 +39,9 @@ from src.database.init_db import count_valid_region_a_readings
 
 logger = logging.getLogger(__name__)
 
-#: Absolute, non-configurable minimum number of qualifying Region A readings.
-MIN_REGION_A_RECORDS = 1000
-
 #: Stable machine-readable block reasons (spec section 13).
 BLOCK_CODES = (
     "KILL_SWITCH_ACTIVE",
-    "REGION_A_RECORDS_BELOW_1000",
     "AUTO_CLICK_DISABLED",
     "MODEL_RECALCULATION_REQUIRED",
     "REBUILD_IN_PROGRESS",
@@ -55,6 +51,7 @@ BLOCK_CODES = (
     "RECENT_ACCURACY_TOO_LOW",
     "INVALID_TARGET_COORDINATES",
     "AMOUNT_SOURCE_UNAVAILABLE",
+    "AMOUNT_KEYPAD_NOT_CONFIGURED",
     "DISPLAY_CALIBRATION_CHANGED",
     "TARGET_WINDOW_NOT_VERIFIED",
     "DUPLICATE_ACTION",
@@ -63,7 +60,6 @@ BLOCK_CODES = (
 
 BLOCK_EXPLANATIONS: Dict[str, str] = {
     "KILL_SWITCH_ACTIVE": "The master kill switch is engaged; no clicks are permitted.",
-    "REGION_A_RECORDS_BELOW_1000": "Region A does not yet hold 1,000 valid saved readings.",
     "AUTO_CLICK_DISABLED": "Automated clicking is switched off.",
     "MODEL_RECALCULATION_REQUIRED": "The learning model is stale; recalculate it first.",
     "REBUILD_IN_PROGRESS": "A recalculation is running; clicking is suspended.",
@@ -73,6 +69,7 @@ BLOCK_EXPLANATIONS: Dict[str, str] = {
     "RECENT_ACCURACY_TOO_LOW": "Recent performance is below the configured safeguard.",
     "INVALID_TARGET_COORDINATES": "The click target has not been calibrated.",
     "AMOUNT_SOURCE_UNAVAILABLE": "Auto amount needs a valid saved Region B reading.",
+    "AMOUNT_KEYPAD_NOT_CONFIGURED": "The Input Amount keypad is not fully calibrated.",
     "DISPLAY_CALIBRATION_CHANGED": "The display layout changed since calibration.",
     "TARGET_WINDOW_NOT_VERIFIED": "The intended target window could not be verified.",
     "DUPLICATE_ACTION": "A click was already dispatched for this prediction.",
@@ -99,7 +96,8 @@ class ClickDecision:
     def message(self) -> str:
         if self.allowed:
             return f"{self.outcome}: {self.detail}"
-        return f"Blocked ({self.code}): {explain(self.code)}"
+        suffix = f" Details: {self.detail}" if self.detail else ""
+        return f"Blocked ({self.code}): {explain(self.code)}{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -265,18 +263,12 @@ class AutoClickEngine:
         if self._killed:
             return blocked("KILL_SWITCH_ACTIVE", "master kill switch engaged")
 
-        # 1) MANDATORY 1,000-record gate
-        if region_a_count < MIN_REGION_A_RECORDS:
-            return blocked(
-                "REGION_A_RECORDS_BELOW_1000",
-                f"{region_a_count} / {MIN_REGION_A_RECORDS} valid Region A readings",
-            )
-
-        # 2) Master enable
+        # 1) Master enable. The live Region A count above is informational only;
+        # there is intentionally no minimum-row prerequisite for clicking.
         if not get_setting_bool(conn, "auto_click_enabled", False):
             return blocked("AUTO_CLICK_DISABLED")
 
-        # 3/4) Model validity and recalculation state
+        # 2/3) Model validity and recalculation state
         if get_setting_bool(conn, "rebuild_in_progress", False):
             return blocked("REBUILD_IN_PROGRESS")
         if (get_setting(conn, "model_stale", "1") == "1"
@@ -290,9 +282,9 @@ class AutoClickEngine:
             if definition is None or not definition.enabled:
                 return blocked("CATEGORY_NOT_ENABLED", "matched pattern is not active")
 
-        # 5–8) Prediction-quality conditions can be ignored only for an
-        # active user-defined pattern match. Master enable, stale-model state,
-        # the hard record gate and dispatch safeguards remain enforced.
+        # 4–7) Prediction-quality conditions can be ignored only for an
+        # active user-defined pattern match. Master enable, stale-model state
+        # and dispatch safeguards remain enforced.
         if ignore_prediction_conditions:
             definition_id = prediction.get("definition_id")
             if definition_id is None:
@@ -328,7 +320,7 @@ class AutoClickEngine:
                         f"recent accuracy {recent if recent is not None else 'n/a'} < {recent_min:.2f}%",
                     )
 
-        # 9/10) Click points and display calibration
+        # 8/9) Click points and display calibration
         # Every configured point must exist and still sit on the display layout
         # it was calibrated against; the whole sequence is refused if any point
         # drifted, so a partially stale sequence never runs.
@@ -345,7 +337,12 @@ class AutoClickEngine:
                     return blocked("AMOUNT_SOURCE_UNAVAILABLE", "automatic amount requires a saved Region B reading")
             required_keys = set("0123456789") | {".", "clear", "done"}
             if not required_keys.issubset(keypad):
-                return blocked("INVALID_TARGET_COORDINATES", "amount keypad is not fully calibrated")
+                missing = ", ".join(sorted(required_keys - set(keypad)))
+                return blocked(
+                    "AMOUNT_KEYPAD_NOT_CONFIGURED",
+                    f"missing keypad position(s): {missing}; open Input Amount "
+                    "and calibrate them before testing",
+                )
             targets += [keypad[k] for k in required_keys]
         for index, target in enumerate(targets, start=1):
             tx_i, ty_i = int(target["x"]), int(target["y"])
@@ -363,12 +360,12 @@ class AutoClickEngine:
                     )
         tx, ty = int(targets[0]["x"]), int(targets[0]["y"])
 
-        # 11) Target-window verification (only when the design requires it)
+        # 10) Target-window verification (only when the design requires it)
         if get_setting_bool(conn, "require_window_verification", False):
             if self._target_verifier is None or not self._target_verifier(targets[0]):
                 return blocked("TARGET_WINDOW_NOT_VERIFIED")
 
-        # 12) Duplicate dispatch prevention
+        # 11) Duplicate dispatch prevention
         prediction_id = prediction.get("prediction_id")
         if prediction_id is not None:
             row = conn.execute(
@@ -378,7 +375,7 @@ class AutoClickEngine:
             if row is not None and int(row["click_dispatched"]) == 1:
                 return blocked("DUPLICATE_ACTION", "already dispatched for this prediction")
 
-        # 13) Cooldown
+        # 12) Cooldown
         cooldown = get_setting_float(conn, "cooldown_seconds", 5.0)
         last_ts = self._last_dispatch_time()
         if last_ts is not None:
@@ -428,7 +425,7 @@ class AutoClickEngine:
         """Immediately dispatch the saved sequence, bypassing all automation gates.
 
         This explicit manual test entry point intentionally ignores dry-run,
-        kill-switch, record-count, pattern, eligibility, calibration-drift, and
+        kill-switch, pattern, eligibility, calibration-drift, and
         target-window gates. Only configured actions can be dispatched.
         """
         workflow = get_click_workflow(self._conn)
@@ -441,6 +438,29 @@ class AutoClickEngine:
             decision.detail = "manual test: no saved click sequence"
             self._audit(decision, dry_run=False)
             return decision
+        amount_steps = [s for s in workflow if s.get("type") == "amount"]
+        if amount_steps:
+            if any(s.get("mode") == "auto" for s in amount_steps):
+                from src.learning.repository import last_region_b_reading
+                if last_region_b_reading(self._conn) is None:
+                    decision.allowed = False
+                    decision.code = "AMOUNT_SOURCE_UNAVAILABLE"
+                    decision.detail = (
+                        "manual test: automatic amount requires a saved Region B reading"
+                    )
+                    self._audit(decision, dry_run=False)
+                    return decision
+            required_keys = set("0123456789") | {".", "clear", "done"}
+            missing = required_keys - set(keypad)
+            if missing:
+                decision.allowed = False
+                decision.code = "AMOUNT_KEYPAD_NOT_CONFIGURED"
+                decision.detail = (
+                    "manual test: missing keypad position(s): "
+                    f"{', '.join(sorted(missing))}; open Input Amount and calibrate them"
+                )
+                self._audit(decision, dry_run=False)
+                return decision
         try:
             ok, detail = self._dispatch_workflow(
                 workflow, keypad, {}, get_click_sequence_delay_ms(self._conn))
@@ -545,9 +565,9 @@ class AutoClickEngine:
         count = count_valid_region_a_readings(conn)
         return {
             "region_a_count": count,
-            "required": MIN_REGION_A_RECORDS,
-            "remaining": max(0, MIN_REGION_A_RECORDS - count),
-            "unlocked": count >= MIN_REGION_A_RECORDS,
+            "required": None,
+            "remaining": 0,
+            "unlocked": True,
             "auto_click_enabled": get_setting_bool(conn, "auto_click_enabled", False),
             "dry_run": get_setting_bool(conn, "auto_click_dry_run", True),
             "killed": self._killed,

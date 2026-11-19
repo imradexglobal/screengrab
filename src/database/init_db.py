@@ -798,10 +798,10 @@ def _migrate_legacy_detections(conn: sqlite3.Connection) -> None:
 def count_valid_region_a_readings(conn: sqlite3.Connection) -> int:
     """Return the number of qualifying, persisted Region A readings.
 
-    This is the *only* quantity that may satisfy the mandatory 1,000-record
-    automation gate (spec section 12).  It counts persisted rows in
-    ``readings`` for Region A; OCR attempts, rejected readings, diagnostics,
-    predictions and Region B data are deliberately excluded.
+    It counts persisted rows in ``readings`` for Region A; OCR attempts,
+    rejected readings, diagnostics, predictions and Region B data are
+    deliberately excluded. The result is used for statistics and click
+    auditing; it does not gate clicking.
     """
     cur = conn.execute(
         "SELECT COUNT(*) AS n FROM readings WHERE region_id = ?",

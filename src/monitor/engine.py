@@ -7,12 +7,11 @@ Owns the scan loop and wires together the pieces of the upgraded pipeline:
 Two region slots only (spec section 5): ``region-A`` is the active reader that
 feeds learning, statistics, predictions and clicks; ``region-B`` may also be
 activated and is captured by the same pipeline, but its rows are written to the
-store-only ``region_b_readings`` table - they never enter ``readings``, the
-model, the statistics or the gate.
+    store-only ``region_b_readings`` table - they never enter ``readings``, the
+    model or the statistics.
 
-The mandatory 1,000-record automation gate is **not** implemented here - it
-lives inside :mod:`src.automation.clicker`, in the execution path itself, so
-nothing in this module (or the UI) can bypass it.
+Clicking has no minimum-row prerequisite. The click engine still evaluates all
+other safety conditions in the execution path.
 """
 
 import logging
@@ -961,6 +960,16 @@ class MonitoringEngine(QObject):
         self._after_pattern_change()
         return pattern_id
 
+    def generate_most_frequent_patterns(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Replace definitions with the strongest observed UP/DOWN patterns."""
+        if self._conn is None:
+            return []
+        with self._model_lock:
+            generated = learn_repo.generate_most_frequent_movement_patterns(
+                self._conn, limit=limit)
+        self._after_pattern_change()
+        return generated
+
     def delete_pattern(self, pattern_id: int) -> bool:
         if self._conn is None:
             return False
@@ -1033,8 +1042,8 @@ class MonitoringEngine(QObject):
     def gate_status(self) -> Dict[str, Any]:
         if self._auto_click is None or self._conn is None:
             return {
-                "region_a_count": 0, "required": 1000, "remaining": 1000,
-                "unlocked": False, "auto_click_enabled": False, "dry_run": True,
+                "region_a_count": 0, "required": None, "remaining": 0,
+                "unlocked": True, "auto_click_enabled": False, "dry_run": True,
                 "killed": False, "model_stale": True, "rebuilding": False,
             }
         return self._auto_click.gate_status()

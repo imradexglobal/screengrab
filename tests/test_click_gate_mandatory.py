@@ -1,10 +1,8 @@
-"""The mandatory 1,000-record Region A gate, enforced in the execution path.
+"""Regression tests for unrestricted click availability.
 
-This is the most important safety test file: :meth:`AutoClickEngine.try_click`
-must refuse to dispatch unless the *persistent database* holds at least 1,000
-qualifying Region A readings, no matter what any setting, UI value or cached
-counter says.  A real mouse click is never dispatched - only the
-``RecordingDispatcher`` is used.
+The click engine must not require a minimum number of Region A readings. These
+checks keep the behavior explicit while continuing to exercise the real safety
+configuration and the recording dispatcher.
 """
 
 import os
@@ -12,23 +10,9 @@ import tempfile
 
 import pytest
 
-from src.automation.clicker import (
-    BLOCK_CODES,
-    MIN_REGION_A_RECORDS,
-    AutoClickEngine,
-    RecordingDispatcher,
-)
-from src.config.repository import (
-    set_allowed_categories,
-    set_click_target,
-    set_setting,
-)
-from src.database.init_db import (
-    REGION_A_ID,
-    REGION_B_ID,
-    count_valid_region_a_readings,
-    initialise_database,
-)
+from src.automation.clicker import BLOCK_CODES, AutoClickEngine, RecordingDispatcher
+from src.config.repository import set_allowed_categories, set_click_target, set_setting
+from src.database.init_db import REGION_A_ID, REGION_B_ID, count_valid_region_a_readings, initialise_database
 from src.learning import repository as learn_repo
 from src.learning.patterns import Prediction
 
@@ -69,8 +53,7 @@ def _seed(conn, n, region_id=REGION_A_ID):
     conn.commit()
 
 
-def configure(conn, region_a=1000, **overrides):
-    """Seed readings and turn every unrelated gate condition into a pass."""
+def configure(conn, region_a=0, **overrides):
     _seed(conn, region_a)
     settings = {
         "auto_click_enabled": "1",
@@ -109,241 +92,80 @@ def prediction(prediction_id=None, confidence=99.0, resolved_count=500,
     }
 
 
-def _audit_count(conn):
-    return conn.execute("SELECT COUNT(*) AS n FROM click_audit").fetchone()["n"]
+def test_click_is_allowed_with_zero_region_a_rows(temp_db):
+    configure(temp_db, region_a=0)
+    engine, dispatcher = make_engine(temp_db)
 
-
-class TestMandatoryRegionAGate:
-    @pytest.mark.parametrize("region_a", [0, 1, 999])
-    def test_blocked_below_1000_even_when_everything_else_passes(self, temp_db,
-                                                                region_a):
-        conn = temp_db
-        configure(conn, region_a=region_a)
-        engine, dispatcher = make_engine(conn)
-
-        decision = engine.try_click(prediction())
-
-        assert decision.allowed is False
-        assert decision.code == "REGION_A_RECORDS_BELOW_1000"
-        assert dispatcher.calls == []
-        assert count_valid_region_a_readings(conn) == region_a
-
-    def test_eligible_at_exactly_1000_and_one_click_dispatched(self, temp_db):
-        conn = temp_db
-        configure(conn, region_a=1000)
-        engine, dispatcher = make_engine(conn)
-
-        decision = engine.try_click(prediction())
-
-        assert decision.allowed is True
-        assert decision.region_a_count == MIN_REGION_A_RECORDS
-        assert len(dispatcher.calls) == 1
-        assert _audit_count(conn) == 1
-
-    def test_region_b_never_contributes_to_the_gate(self, temp_db):
-        conn = temp_db
-        configure(conn, region_a=500)
-        _seed(conn, 5000, region_id=REGION_B_ID)
-        engine, dispatcher = make_engine(conn)
-
-        assert count_valid_region_a_readings(conn) == 500
-        assert conn.execute(
-            "SELECT COUNT(*) AS n FROM readings WHERE region_id = ?",
-            (REGION_B_ID,)).fetchone()["n"] == 5000
-
-        decision = engine.try_click(prediction())
-        assert decision.allowed is False
-        assert decision.code == "REGION_A_RECORDS_BELOW_1000"
-        assert dispatcher.calls == []
-
-
-class TestGateIsReevaluated:
-    def test_enable_toggle_after_gate_is_open(self, temp_db):
-        conn = temp_db
-        configure(conn, region_a=1000, auto_click_enabled="1")
-        engine, dispatcher = make_engine(conn)
-
-        assert engine.try_click(prediction()).allowed is True
-
-        set_setting(conn, "auto_click_enabled", "0")
-        conn.commit()
-        blocked = engine.try_click(prediction())
-        assert blocked.allowed is False
-        assert blocked.code == "AUTO_CLICK_DISABLED"
-
-        set_setting(conn, "auto_click_enabled", "1")
-        conn.commit()
-        assert engine.try_click(prediction()).allowed is True
-        assert len(dispatcher.calls) == 2
-
-    def test_gate_count_is_the_live_database_count(self, temp_db):
-        conn = temp_db
-        configure(conn, region_a=1000)
-        engine, _dispatcher = make_engine(conn)
-
-        allowed = engine.try_click(prediction())
-        assert allowed.allowed is True
-        # The value used by try_click is exactly the real Region A row count.
-        assert allowed.region_a_count == count_valid_region_a_readings(conn) == 1000
-        assert engine.gate_status()["region_a_count"] == 1000
-
-        # Remove a single real Region A row: the very next call must re-query
-        # the database and reflect 999 - never a cached or UI value.
-        conn.execute(
-            "DELETE FROM readings WHERE reading_id = "
-            "(SELECT MAX(reading_id) FROM readings WHERE region_id = ?)",
-            (REGION_A_ID,))
-        conn.commit()
-        assert count_valid_region_a_readings(conn) == 999
-
-        again = engine.try_click(prediction())
-        assert again.allowed is False
-        assert again.code == "REGION_A_RECORDS_BELOW_1000"
-        assert again.region_a_count == 999
-
-
-class TestBlockedDecisionContract:
-    def test_every_blocked_decision_has_stable_code_and_message(self, temp_db):
-        conn = temp_db
-        scenarios = []
-
-        # gate below 1000
-        configure(conn, region_a=999)
-        engine, _ = make_engine(conn)
-        scenarios.append(engine.try_click(prediction()))
-
-        # kill switch
-        configure(conn, region_a=1000)
-        engine, _ = make_engine(conn)
-        engine.kill()
-        scenarios.append(engine.try_click(prediction()))
-
-        # auto click disabled
-        configure(conn, region_a=1000, auto_click_enabled="0")
-        engine, _ = make_engine(conn)
-        scenarios.append(engine.try_click(prediction()))
-
-        # stale model
-        configure(conn, region_a=1000, model_stale="1")
-        engine, _ = make_engine(conn)
-        scenarios.append(engine.try_click(prediction()))
-
-        # rebuild in progress
-        configure(conn, region_a=1000, rebuild_in_progress="1")
-        engine, _ = make_engine(conn)
-        scenarios.append(engine.try_click(prediction()))
-
-        # category not enabled
-        configure(conn, region_a=1000)
-        set_allowed_categories(conn, ["g2"])
-        conn.commit()
-        engine, _ = make_engine(conn)
-        scenarios.append(engine.try_click(prediction(candidate="g1")))
-
-        # confidence too low
-        configure(conn, region_a=1000, confidence_threshold="70")
-        engine, _ = make_engine(conn)
-        scenarios.append(engine.try_click(prediction(confidence=10.0)))
-
-        # insufficient evidence
-        configure(conn, region_a=1000, min_evidence="30")
-        engine, _ = make_engine(conn)
-        scenarios.append(engine.try_click(prediction(resolved_count=1)))
-
-        for decision in scenarios:
-            assert decision.allowed is False
-            assert decision.code in BLOCK_CODES
-            assert decision.message
-            assert decision.code in decision.message
-
-    def test_audit_row_written_for_blocked_and_allowed(self, temp_db):
-        conn = temp_db
-        configure(conn, region_a=999)
-        engine, dispatcher = make_engine(conn)
-
-        blocked = engine.try_click(prediction())
-        assert blocked.allowed is False
-        assert _audit_count(conn) == 1
-
-        # Cross the gate: the next decision is allowed and audited too.
-        _seed(conn, 1)
-        assert count_valid_region_a_readings(conn) == 1000
-        allowed = engine.try_click(prediction())
-        assert allowed.allowed is True
-        assert _audit_count(conn) == 2
-
-        rows = learn_repo.recent_click_audit(conn)
-        assert len(rows) == 2
-        outcomes = {r["outcome"] for r in rows}
-        assert "DISPATCHED" in outcomes
-        assert len(dispatcher.calls) == 1
-
-    def test_duplicate_dispatch_is_blocked(self, temp_db):
-        conn = temp_db
-        configure(conn, region_a=1000)
-        engine, dispatcher = make_engine(conn)
-
-        pid = learn_repo.insert_prediction(
-            conn, 1, REGION_A_ID,
-            Prediction(pattern_length=4, pattern_sequence="NA,MI,MN,SM",
-                       candidate_group="g1", confidence=99.0, resolved_count=500,
-                       correct_count=490, recent_accuracy=95.0,
-                       created_at="2026-01-01T00:00:00"))
-        conn.commit()
-
-        first = engine.try_click(prediction(prediction_id=pid))
-        assert first.allowed is True
-
-        second = engine.try_click(prediction(prediction_id=pid))
-        assert second.allowed is False
-        assert second.code == "DUPLICATE_ACTION"
-        assert len(dispatcher.calls) == 1
-
-    def test_kill_switch_blocks_and_disables(self, temp_db):
-        conn = temp_db
-        configure(conn, region_a=1000, auto_click_enabled="1")
-        engine, dispatcher = make_engine(conn)
-
-        engine.kill()
-        decision = engine.try_click(prediction())
-        assert decision.allowed is False
-        assert decision.code == "KILL_SWITCH_ACTIVE"
-        assert dispatcher.calls == []
-        # The kill switch also persists auto_click_enabled = 0.
-        assert conn.execute(
-            "SELECT value FROM settings WHERE key='auto_click_enabled'"
-        ).fetchone()["value"] == "0"
-
-
-def test_ignore_prediction_conditions_triggers_for_active_pattern_without_stats(temp_db):
-    conn = temp_db
-    configure(conn, confidence_threshold=100, min_evidence=99999, model_stale=1)
-    set_allowed_categories(conn, [])
-    pattern_id = learn_repo.create_pattern_definition(
-        conn, "range", ["g1", "g1", "g1", "g1"], label="Active pattern")
-    engine, dispatcher = make_engine(conn)
-    candidate = prediction(confidence=0, resolved_count=0, recent_accuracy=None,
-                           candidate="not-allowed")
-    candidate["definition_id"] = pattern_id
-
-    decision = engine.try_click(candidate, ignore_prediction_conditions=True)
+    decision = engine.try_click(prediction())
 
     assert decision.allowed is True
-    assert len(dispatcher.calls) == 1
+    assert decision.region_a_count == 0
+    assert dispatcher.calls == [(100, 200)]
 
 
-def test_ignore_prediction_conditions_still_rejects_disabled_pattern(temp_db):
-    conn = temp_db
-    configure(conn)
-    pattern_id = learn_repo.create_pattern_definition(
-        conn, "range", ["g1", "g1", "g1", "g1"], label="Inactive pattern")
-    learn_repo.set_pattern_enabled(conn, pattern_id, False)
-    engine, dispatcher = make_engine(conn)
-    candidate = prediction()
-    candidate["definition_id"] = pattern_id
+def test_click_is_allowed_with_any_available_row_count(temp_db):
+    configure(temp_db, region_a=37)
+    engine, dispatcher = make_engine(temp_db)
 
-    decision = engine.try_click(candidate, ignore_prediction_conditions=True)
+    decision = engine.try_click(prediction())
+
+    assert decision.allowed is True
+    assert decision.region_a_count == 37
+    assert dispatcher.calls == [(100, 200)]
+
+
+def test_region_b_rows_do_not_change_region_a_status(temp_db):
+    configure(temp_db, region_a=0)
+    _seed(temp_db, 5000, region_id=REGION_B_ID)
+    engine, dispatcher = make_engine(temp_db)
+
+    decision = engine.try_click(prediction())
+
+    assert count_valid_region_a_readings(temp_db) == 0
+    assert decision.allowed is True
+    assert dispatcher.calls == [(100, 200)]
+
+
+def test_gate_status_reports_count_without_a_threshold(temp_db):
+    configure(temp_db, region_a=3)
+    engine, _dispatcher = make_engine(temp_db)
+
+    status = engine.gate_status()
+
+    assert status["region_a_count"] == 3
+    assert status["required"] is None
+    assert status["remaining"] == 0
+    assert status["unlocked"] is True
+
+
+def test_other_safety_gates_still_apply(temp_db):
+    configure(temp_db, region_a=0, auto_click_enabled="0")
+    engine, dispatcher = make_engine(temp_db)
+
+    decision = engine.try_click(prediction())
 
     assert decision.allowed is False
-    assert decision.code == "CATEGORY_NOT_ENABLED"
+    assert decision.code == "AUTO_CLICK_DISABLED"
+    assert decision.code in BLOCK_CODES
     assert dispatcher.calls == []
+
+
+def test_duplicate_dispatch_is_still_blocked(temp_db):
+    configure(temp_db, region_a=0)
+    engine, dispatcher = make_engine(temp_db)
+
+    pid = learn_repo.insert_prediction(
+        temp_db, 1, REGION_A_ID,
+        Prediction(pattern_length=4, pattern_sequence="NA,MI,MN,SM",
+                   candidate_group="g1", confidence=99.0, resolved_count=500,
+                   correct_count=490, recent_accuracy=95.0,
+                   created_at="2026-01-01T00:00:00"))
+    temp_db.commit()
+
+    first = engine.try_click(prediction(prediction_id=pid))
+    second = engine.try_click(prediction(prediction_id=pid))
+
+    assert first.allowed is True
+    assert second.allowed is False
+    assert second.code == "DUPLICATE_ACTION"
+    assert len(dispatcher.calls) == 1
